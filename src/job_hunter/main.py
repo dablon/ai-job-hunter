@@ -23,6 +23,7 @@ PENDING_JOBS_PATH = Path(os.environ.get("PENDING_JOBS_PATH", "pending_jobs.json"
 ENV_OVERRIDES = {
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "minimax_api_key": "MINIMAX_API_KEY",
+    "minimax_model": "MINIMAX_MODEL",
     "email_sender": "EMAIL_SENDER",
     "email_app_password": "EMAIL_APP_PASSWORD",
     "email_recipient": "EMAIL_RECIPIENT",
@@ -48,6 +49,8 @@ def load_config() -> dict:
         value = os.environ.get(env_var)
         if value:
             config[config_key] = value
+            if "api_key" in config_key:
+                logger.info(f"Loaded {config_key}: {value[:10]}...")
 
     if os.environ.get("PROFILE"):
         config["profile"] = os.environ["PROFILE"]
@@ -105,6 +108,15 @@ def main() -> None:
     )
 
     config = load_config()
+
+    # Step 0: AI Profile Analysis & Refinement
+    logger.info("--- Step 0: AI Profile Analysis ---")
+    from job_hunter.filter import analyze_and_refine_profile
+    config = analyze_and_refine_profile(config, provider=args.provider)
+    if config.get("search_tips"):
+        logger.info(f"Search tips: {config['search_tips']}")
+    logger.info(f"Refined profile: {config.get('profile', '')[:100]}...")
+    logger.info(f"Keywords: {config.get('keywords', [])}")
 
     # Validate provider-specific API keys
     if args.provider == "anthropic" and not config.get("anthropic_api_key"):

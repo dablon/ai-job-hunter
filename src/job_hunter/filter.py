@@ -17,7 +17,6 @@ from job_hunter.utils import retry_with_backoff
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5"
-MINIMAX_MODEL = "MiniMax-M2.5"
 BATCH_SIZE = 25
 MAX_TOKENS = 4096
 MAX_DESCRIPTION_CHARS = 1500
@@ -35,6 +34,153 @@ class ApprovedJob(BaseModel):
 
 class FilterResult(BaseModel):
     approved: list[ApprovedJob]
+
+
+# ---------------------------------------------------------------------------
+# Profile Analysis & Refinement
+# ---------------------------------------------------------------------------
+
+
+def analyze_and_refine_profile(config: dict, provider: str = "minimax") -> dict:
+    """Analyze user profile with AI and return refined config.
+    
+    This step uses AI to:
+    - Identify key skills and strengths from the profile
+    - Suggest better keywords for job search
+    - Refine search criteria for better matches
+    
+    Returns a modified config with refined profile/keywords.
+    """
+    profile = config.get("profile", "")
+    keywords = config.get("keywords", [])
+    location = config.get("location", "")
+    remote_only = config.get("remote_only", True)
+    
+    if not profile:
+        logger.warning("No profile found, skipping AI analysis")
+        return config
+    
+    if provider == "minimax":
+        return _analyze_profile_minimax(config)
+    else:
+        return _analyze_profile_anthropic(config)
+
+
+def _analyze_profile_minimax(config: dict) -> dict:
+    """Use Minimax to analyze and refine the profile."""
+    import requests
+    
+    api_key = config.get("minimax_api_key", "")
+    model = config.get("minimax_model", "MiniMax-M2.5")
+    
+    if not api_key:
+        logger.warning("No minimax_api_key, skipping profile analysis")
+        return config
+    
+    profile = config.get("profile", "")
+    keywords = config.get("keywords", [])
+    
+    prompt = f"""Analyze this job seeker profile and provide refined search parameters.
+
+## Current Profile:
+{profile}
+
+## Current Keywords:
+{", ".join(keywords)}
+
+## Current Preferences:
+- Location: {config.get("location", "Any")}
+- Remote only: {config.get("remote_only", True)}
+
+Respond with ONLY a JSON object containing:
+{{
+  "refined_profile": "2-3 sentence summary of the candidate's ideal job targets",
+  "suggested_keywords": ["keyword1", "keyword2", ...],
+  "search_tips": "2-3 specific tips for finding matching jobs"
+}}
+
+Focus on: tech stack, seniority level, industry fit, and role types."""
+
+    url = "https://api.minimax.io/v1/text/chatcompletion_v2"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a career advisor and job search expert. Analyze profiles and suggest optimized job search strategies."},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 800,
+        "temperature": 0.3,
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.info(f"AI Profile Analysis response: {content[:200]}...")
+        
+        result = json.loads(content)
+        
+        refined_config = config.copy()
+        refined_config["profile"] = result.get("refined_profile", profile)
+        refined_config["keywords"] = result.get("suggested_keywords", keywords)
+        refined_config["search_tips"] = result.get("search_tips", "")
+        
+        logger.info(f"Profile refined. New keywords: {refined_config['keywords']}")
+        return refined_config
+        
+    except Exception as e:
+        logger.warning(f"Profile analysis failed: {e}, using original config")
+        return config
+
+
+def _analyze_profile_anthropic(config: dict) -> dict:
+    """Use Anthropic to analyze and refine the profile."""
+    api_key = config.get("anthropic_api_key", "")
+    
+    if not api_key:
+        logger.warning("No anthropic_api_key, skipping profile analysis")
+        return config
+    
+    prompt = f"""Analyze this job seeker profile and provide refined search parameters.
+
+## Current Profile:
+{config.get("profile", "")}
+
+## Current Keywords:
+{", ".join(config.get("keywords", []))}
+
+Respond with ONLY a JSON object containing:
+{{
+  "refined_profile": "2-3 sentence summary",
+  "suggested_keywords": ["keyword1", "keyword2", ...]
+}}"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        content = message.content[0].text
+        result = json.loads(content)
+        
+        refined_config = config.copy()
+        refined_config["profile"] = result.get("refined_profile", config.get("profile", ""))
+        refined_config["keywords"] = result.get("suggested_keywords", config.get("keywords", []))
+        
+        return refined_config
+        
+    except Exception as e:
+        logger.warning(f"Profile analysis failed: {e}, using original config")
+        return config
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +385,13 @@ def _make_minimax_batch_fn(config: dict, profile: str, constraints: str):
     api_key = config.get("minimax_api_key", "")
     if not api_key:
         raise RuntimeError("minimax_api_key not set in config")
-
+    if len(api_key) < 20:
+        raise RuntimeError(f"minimax_api_key seems invalid (too short): {api_key[:10]}...")
+    
+    model = config.get("minimax_model", "MiniMax-M2.5")
+    
     def batch_fn(batch: list[dict]) -> FilterResult:
-        return _filter_batch_minimax(batch, profile, constraints, api_key)
+        return _filter_batch_minimax(batch, profile, constraints, api_key, model)
 
     return batch_fn
 
@@ -251,6 +401,7 @@ def _filter_batch_minimax(
     profile: str,
     constraints: str,
     api_key: str,
+    model: str = "MiniMax-M2.5",
 ) -> FilterResult:
     """Call Minimax API and parse the JSON response."""
     jobs_text = _format_jobs_for_prompt(batch)
@@ -286,7 +437,7 @@ def _filter_batch_minimax(
     )
 
     # Minimax API endpoint
-    url = "https://api.minimax.chat/v1/text/chatcompletion_pro"
+    url = "https://api.minimax.io/v1/text/chatcompletion_v2"
     
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -294,7 +445,7 @@ def _filter_batch_minimax(
     }
 
     payload = {
-        "model": MINIMAX_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -470,10 +621,10 @@ def _format_jobs_for_prompt(batch: list[dict]) -> str:
     """Format a batch of jobs into a text prompt."""
     lines = []
     for i, job in enumerate(batch):
-        title = job.get("title", "Unknown")[:100]
-        company = job.get("company_name", "Unknown")[:50]
-        location = job.get("location", "Unknown")[:50]
-        description = job.get("description", "")[:MAX_DESCRIPTION_CHARS]
+        title = str(job.get("title", "Unknown"))[:100]
+        company = str(job.get("company_name", "Unknown"))[:50]
+        location = str(job.get("location", "Unknown"))[:50]
+        description = str(job.get("description", ""))[:MAX_DESCRIPTION_CHARS]
         url = job.get("url", "")
 
         lines.append(
