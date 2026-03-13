@@ -1,0 +1,11 @@
+{
+  "profile": "Your professional profile describing your skills, experience, and what you're looking for in a job. Example: Python developer with 5 years of experience in backend development, AWS, Docker, and CI/CD pipelines. Looking for remote positions in fintech or e-commerce.",
+  "keywords": [
+    "python developer",
+    "backend engineer",
+    "devops engineer"
+  ],
+  "location": "Colombia",
+  "remote_only": true,
+  "opencode_model": "minimax/MiniMax-M2.5"
+}

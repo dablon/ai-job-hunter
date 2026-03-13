@@ -1,0 +1,56 @@
+name: Job Hunter (Minimax Edition)
+
+on:
+  schedule:
+    # Run daily at 9:00 AM UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'AI Provider'
+        required: false
+        default: 'minimax'
+        type: choice
+        options:
+          - minimax
+          - anthropic
+          - opencode
+      notify:
+        description: 'Notification Channel'
+        required: false
+        default: 'email'
+        type: choice
+        options:
+          - email
+          - discord
+
+jobs:
+  job-hunter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run Job Hunter
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENCODE_MODEL: ${{ secrets.OPENCODE_MODEL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PROFILE: ${{ secrets.PROFILE }}
+          KEYWORDS: ${{ secrets.KEYWORDS }}
+        run: |
+          job-hunter --provider ${{ github.event.inputs.provider || 'minimax' }} --notify ${{ github.event.inputs.notify || 'email' }}
