@@ -141,12 +141,12 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           pattern: dist-*
           merge-multiple: true
 
       - name: List files
-        run: ls -la artifacts/
+        run: ls -la dist/
 
       - name: Generate changelog
         id: changelog
@@ -177,7 +177,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(needs.version.outputs.version, 'beta') || contains(needs.version.outputs.version, 'alpha') }}
           files: |
-            artifacts/*
+            dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -187,6 +187,9 @@ jobs:
     if: needs.version.outputs.is_new_tag == 'true'
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout
@@ -197,9 +200,12 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           pattern: dist-*
           merge-multiple: true
+
+      - name: List files
+        run: ls -la dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
