@@ -1,60 +1,90 @@
-name: Release
+name: Release Pipeline
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+      - master
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v1.2.0)'
+        description: 'Manual version (e.g., v1.2.0)'
         required: false
 
 jobs:
-  validate:
+  # ========== AUTO VERSION ==========
+  version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      is_new_tag: ${{ steps.version.outputs.is_new_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Extract version
+      - name: Determine version
         id: version
         run: |
+          # Manual version override
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
+            IS_NEW="true"
           else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
+            # Auto-bump from commits
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
-      - name: Validate version format
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid version format: $VERSION"
-            echo "Expected format: vMAJOR.MINOR.PATCH"
-            exit 1
-          fi
-          echo "Version $VERSION is valid"
+            if [ -n "$LAST_TAG" ]; then
+              LAST_TAG="${LAST_TAG#v}"
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$LAST_TAG"
 
+              COMMITS=$(git log --pretty=format:"%s" "$LAST_TAG..HEAD" --no-merges)
+
+              if echo "$COMMITS" | grep -qiE "^(feat|feature)[:\(]"; then
+                BUMP="minor"
+              elif echo "$COMMITS" | grep -qiE "BREAKING CHANGE|break:"; then
+                BUMP="major"
+              else
+                BUMP="patch"
+              fi
+
+              case $BUMP in
+                major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+                minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+                patch) PATCH=$((PATCH + 1)) ;;
+              esac
+
+              VERSION="$MAJOR.$MINOR.$PATCH"
+            else
+              VERSION="1.0.0"
+            fi
+            IS_NEW="true"
+          fi
+
+          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+          echo "is_new_tag=$IS_NEW" >> $GITHUB_OUTPUT
+          echo "Version: v$VERSION, new: $IS_NEW"
+
+  # ========== BUILD MULTIPLATFORM ==========
   build:
-    needs: validate
-    runs-on: ${{ matrix.os }}
+    needs: version
+    if: needs.version.outputs.is_new_tag == 'true'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        python-version: ['3.11', '3.12']
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.11', '3.12', '3.13']
         exclude:
           - os: macos-latest
-            python-version: '3.13'
+            python-version: '3.12'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.version }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -64,7 +94,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install build twine
+          pip install build twine pytest
+
+      - name: Run tests
+        run: |
+          pip install -e ".[dev]"
+          pytest -v
 
       - name: Build package
         run: |
@@ -74,127 +109,119 @@ jobs:
         run: |
           twine check dist/*
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.os }}-py${{ matrix.python-version }}
           path: dist/
-          retention-days: 5
+          retention-days: 1
 
+  # ========== CREATE GITHUB RELEASE ==========
   release:
-    needs: [validate, build]
+    needs: [version, build]
+    if: needs.version.outputs.is_new_tag == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ needs.version.outputs.version }}
           fetch-depth: 0
 
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: List files
+        run: ls -la artifacts/
 
       - name: Generate changelog
         id: changelog
         run: |
-          VERSION="${{ needs.validate.outputs.version }}"
+          VERSION="${{ needs.version.outputs.version }}"
           TAG_NAME="${VERSION#v}"
-
-          # Get previous tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
 
           if [ -n "$PREV_TAG" ]; then
-            CHANGES=$(git log --pretty=format:"- %s (%h)" "$PREV_TAG..HEAD" --no-merges)
+            CHANGES=$(git log --pretty=format:"- %s" "$PREV_TAG..HEAD" --no-merges)
           else
-            CHANGES=$(git log --pretty=format:"- %s (%h)" --no-merges -n 50)
+            CHANGES=$(git log --pretty=format:"- %s" --no-merges -n 20)
           fi
 
-          {
-            echo "## What's Changed"
-            echo ""
-            echo "$CHANGES"
-            echo ""
-            echo "**Full Changelog**: https://github.com/dablon/ai-job-hunter/compare/$PREV_TAG...$VERSION"
-          } >> changelog.md
+          cat << EOF > changelog.md
+          ## What's Changed
+          $CHANGES
 
-          cat changelog.md
+          **Full Changelog**: https://github.com/dablon/ai-job-hunter/compare/$PREV_TAG...$VERSION
+          EOF
 
       - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.validate.outputs.version }}
-          release_name: Release ${{ needs.validate.outputs.version }}
+          tag_name: ${{ needs.version.outputs.version }}
+          name: Release ${{ needs.version.outputs.version }}
           body_path: changelog.md
           draft: false
-          prerelease: ${{ contains(needs.validate.outputs.version, 'beta') || contains(needs.validate.outputs.version, 'alpha') }}
+          prerelease: ${{ contains(needs.version.outputs.version, 'beta') || contains(needs.version.outputs.version, 'alpha') }}
+          files: |
+            artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload release assets
-        run: |
-          RELEASE_ID=${{ steps.create_release.outputs.id }}
-          ARTIFACTS_DIR="artifacts"
-
-          for dir in "$ARTIFACTS_DIR"/*/; do
-            for file in "$dir"dist/*; do
-              if [ -f "$file" ]; then
-                echo "Uploading: $file"
-                gh release upload "${{ needs.validate.outputs.version }}" "$file" --clobber
-              fi
-            done
-          done
-
-  publish-pypi:
-    needs: [validate, build]
+  # ========== PUBLISH TO PYPI ==========
+  publish:
+    needs: [version, release]
+    if: needs.version.outputs.is_new_tag == 'true'
     runs-on: ubuntu-latest
     environment: pypi
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.version }}
 
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Merge artifacts
-        run: |
-          mkdir -p dist
-          for dir in artifacts/*/; do
-            cp -r "$dir"dist/* dist/ 2>/dev/null || true
-          done
-          ls -la dist/
+          pattern: dist-*
+          merge-multiple: true
 
       - name: Publish to PyPI
-        if: env.PYPI_TOKEN != ''
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
 
-  tag-release:
-    needs: [validate, release]
+  # ========== PUSH TAG (if not exists) ==========
+  tag:
+    needs: version
+    if: needs.version.outputs.is_new_tag == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Get version info
+      - name: Push tag
         run: |
-          VERSION="${{ needs.validate.outputs.version }}"
+          VERSION="${{ needs.version.outputs.version }}"
           TAG_NAME="${VERSION#v}"
 
-          # Check if tag already exists
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
-            echo "Tag $VERSION already exists"
+          if ! git rev-parse "$VERSION" >/dev/null 2>&1; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "v$TAG_NAME" -m "Release v$TAG_NAME"
+            git push origin "v$TAG_NAME"
+            echo "Pushed tag: v$TAG_NAME"
           else
-            echo "Creating lightweight tag: $VERSION"
-            git tag -a "$VERSION" -m "Release $TAG_NAME"
-            git push origin "$VERSION"
+            echo "Tag v$TAG_NAME already exists"
           fi
