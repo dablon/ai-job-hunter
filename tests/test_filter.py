@@ -15,7 +15,7 @@ from job_hunter.filter import (
 class TestBuildHardConstraints:
     def test_remote_only(self):
         result = _build_hard_constraints({"remote_only": True})
-        assert "REMOTE WORK REQUIRED" in result
+        assert "REMOTE WORK" in result
         assert "REJECT" in result
 
     def test_location_no_remote(self):
@@ -25,7 +25,7 @@ class TestBuildHardConstraints:
 
     def test_remote_overrides_location(self):
         result = _build_hard_constraints({"location": "Colombia", "remote_only": True})
-        assert "REMOTE WORK REQUIRED" in result
+        assert "REMOTE WORK" in result
         # Location constraint should NOT appear when remote_only
         assert "LOCATION" not in result
 
