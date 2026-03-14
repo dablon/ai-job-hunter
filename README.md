@@ -135,6 +135,3 @@ The included workflow (`.github/workflows/job-hunter.yml`) can run daily:
 
 GPL-3.0 — See LICENSE file.
 
----
-
-Built with ❤️ for job seekers. Supports Minimax, Anthropic Claude, and OpenCode.
