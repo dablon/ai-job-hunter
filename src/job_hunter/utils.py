@@ -4,7 +4,17 @@ import logging
 import time
 from functools import wraps
 
+import requests
+
 logger = logging.getLogger(__name__)
+
+# Errors that should never be retried - they're fatal
+NON_RETRYABLE_EXCEPTIONS = (
+    ValueError,
+    TypeError,
+    KeyError,
+    ImportError,
+)
 
 # Source color mapping for Discord embeds
 SOURCE_COLORS = {
@@ -31,7 +41,7 @@ def retry_with_backoff(
     func,
     max_retries: int = 3,
     base_delay: float = 5.0,
-    retryable: tuple[type[Exception], ...] = (Exception,),
+    retryable: tuple[type[Exception], ...] = (requests.RequestException,),
     context: str = "",
 ) -> any:
     """Retry *func* with exponential backoff.
@@ -40,7 +50,7 @@ def retry_with_backoff(
         func: Callable to execute.
         max_retries: Maximum number of attempts (0 = no retry).
         base_delay: Initial delay in seconds; doubles each retry.
-        retryable: Tuple of exception types to retry on.
+        retryable: Tuple of exception types to retry on. Defaults to network errors only.
         context: Optional description for logging.
 
     Returns:
@@ -56,6 +66,14 @@ def retry_with_backoff(
         try:
             return func()
         except retryable as exc:
+            # Fail immediately on non-retryable exceptions (ValueError, TypeError, etc.)
+            for non_retry in NON_RETRYABLE_EXCEPTIONS:
+                if isinstance(exc, non_retry):
+                    logger.error(
+                        "[%s] Non-retryable error (skipping retries): %s", context, exc
+                    )
+                    raise exc from None
+
             last_exc = exc
             if attempt < max_retries:
                 logger.warning(

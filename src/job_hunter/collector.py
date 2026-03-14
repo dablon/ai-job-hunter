@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 5  # seconds — doubles each retry (5, 10, 20)
 
+# Errors that are not retryable - skip immediately instead of wasting retries
+NON_RETRYABLE_ERRORS = {
+    "glassdoor is not available for",
+    "glassdoor is not available in",
+    "indeed:indeed is not available",
+    "linkedin:linkedin is not available",
+}
+
+# Errors that indicate a temporary block - skip this site for remaining keywords
+RATE_LIMIT_ERRORS = {"429", "rate limit", "too many requests", "503"}
+
 GUPY_API_URL = "https://employability-portal.gupy.io/api/v1/jobs"
 GUPY_HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -93,6 +104,13 @@ def _collect_jobspy(config: dict) -> list[dict]:
     location: str = config.get("location", "")
     remote_only: bool = config.get("remote_only", False)
     sites: list[str] = ["linkedin", "indeed", "glassdoor"]
+
+    # Glassdoor doesn't support many countries - skip it for unsupported locations
+    GLASSDOOR_UNSUPPORTED = {"colombia", "argentina", "chile", "peru", "mexico", "brazil"}
+    if location.lower().strip() in GLASSDOOR_UNSUPPORTED:
+        sites.remove("glassdoor")
+        logger.info("[glassdoor] skipped — not available for %s", location)
+
     indeed_country = _resolve_indeed_country(location)
 
     combined: list[dict] = []
@@ -120,16 +138,31 @@ def _collect_jobspy(config: dict) -> list[dict]:
                 logger.info("  [%s] '%s' -> %d jobs", site, term, len(jobs))
                 combined.extend(jobs)
             except Exception as exc:
-                if site == "glassdoor" and "429" in str(exc):
+                exc_str = str(exc).lower()
+
+                # Check for non-retryable errors (unsupported country, etc.)
+                if any(err in exc_str for err in NON_RETRYABLE_ERRORS):
                     logger.warning(
-                        "  [glassdoor] 429 rate-limited — skipping remaining keywords"
+                        "  [%s] unsupported — skipping: %s", site, exc
                     )
-                    glassdoor_blocked = True
-                    time.sleep(GLASSDOOR_BACKOFF_DELAY)
-                else:
-                    logger.exception(
-                        "jobspy failed for site='%s' term='%s' — skipping", site, term
+                    # Mark site as blocked to skip remaining keywords
+                    if site == "glassdoor":
+                        glassdoor_blocked = True
+                    continue
+
+                # Check for rate limit errors (429, etc.) - block site for remaining keywords
+                if any(err in exc_str for err in RATE_LIMIT_ERRORS):
+                    logger.warning(
+                        "  [%s] rate-limited — skipping remaining keywords", site
                     )
+                    if site == "glassdoor":
+                        glassdoor_blocked = True
+                        time.sleep(GLASSDOOR_BACKOFF_DELAY)
+                    continue
+
+                logger.exception(
+                    "jobspy failed for site='%s' term='%s' — skipping", site, term
+                )
 
         time.sleep(5)  # pause between sites to reduce rate limiting
 

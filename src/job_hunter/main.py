@@ -84,16 +84,27 @@ def load_config() -> dict:
 
 
 def _save_pending(jobs: list[dict]) -> None:
-    with open(PENDING_JOBS_PATH, "w", encoding="utf-8") as f:
-        json.dump(jobs, f, ensure_ascii=False, indent=2)
-    logger.info("Checkpoint saved: %d jobs in %s", len(jobs), PENDING_JOBS_PATH)
+    try:
+        with open(PENDING_JOBS_PATH, "w", encoding="utf-8") as f:
+            json.dump(jobs, f, ensure_ascii=False, indent=2)
+        logger.info("Checkpoint saved: %d jobs in %s", len(jobs), PENDING_JOBS_PATH)
+    except OSError as e:
+        logger.error("Failed to save pending jobs: %s", e)
 
 
 def _load_pending() -> list[dict]:
-    with open(PENDING_JOBS_PATH, encoding="utf-8") as f:
-        jobs = json.load(f)
-    logger.info("Checkpoint loaded: %d jobs from %s", len(jobs), PENDING_JOBS_PATH)
-    return jobs
+    if not PENDING_JOBS_PATH.exists():
+        logger.warning("No pending jobs file found")
+        return []
+
+    try:
+        with open(PENDING_JOBS_PATH, encoding="utf-8") as f:
+            jobs = json.load(f)
+        logger.info("Checkpoint loaded: %d jobs from %s", len(jobs), PENDING_JOBS_PATH)
+        return jobs
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("Failed to load pending jobs (starting fresh): %s", e)
+        return []
 
 
 def _save_report(jobs: list[dict]) -> Path:
@@ -119,16 +130,24 @@ def _save_report(jobs: list[dict]) -> Path:
 
 def _load_sent_urls() -> set[str]:
     """Load previously sent job URLs for deduplication across runs."""
-    if SENT_URLS_PATH.exists():
+    if not SENT_URLS_PATH.exists():
+        return set()
+
+    try:
         with open(SENT_URLS_PATH, encoding="utf-8") as f:
             return set(json.load(f))
-    return set()
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load sent URLs (starting fresh): %s", e)
+        return set()
 
 
 def _save_sent_urls(urls: set[str]) -> None:
     """Persist sent job URLs."""
-    with open(SENT_URLS_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
+    try:
+        with open(SENT_URLS_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.error("Failed to save sent URLs: %s", e)
 
 
 def _deduplicate_jobs(jobs: list[dict], sent_urls: set[str]) -> list[dict]:
