@@ -3,7 +3,9 @@
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 import pandas as pd
 import requests
@@ -53,7 +55,7 @@ class Spinner:
 _spinner = Spinner()
 
 
-def _spinner() -> str:
+def get_spinner_char() -> str:
     """Return next spinner character (backwards compatibility wrapper)."""
     return _spinner.next()
 
@@ -62,7 +64,7 @@ def _show_progress(source: str, keyword: str, count: int) -> None:
     """Show inline progress update."""
     if sys.stdout.isatty():
         # Clear line and show progress
-        sys.stdout.write(f"\r  {_spinner()} {source:12} | {keyword:30} | {count:3} jobs")
+        sys.stdout.write(f"\r  {get_spinner_char()} {source:12} | {keyword:30} | {count:3} jobs")
         sys.stdout.flush()
 
 MAX_RETRIES = 3
@@ -162,11 +164,53 @@ def _resolve_indeed_country(location: str) -> str:
     return INDEED_COUNTRY_MAP.get(location.strip().lower(), location)
 
 
-def _collect_jobspy(config: dict) -> list[dict]:
-    """Fetch from job sites via the jobspy library.
+# Thread-safe lock for updating seen_urls
+_url_lock = Lock()
 
-    Iterates per site then per keyword so each site failure is isolated.
-    """
+# Max parallel workers for scraping (balance speed vs rate limiting)
+MAX_WORKERS = 4
+
+
+def _scrape_single_job(
+    site: str,
+    term: str,
+    location: str,
+    remote_only: bool,
+    indeed_country: str,
+    seen_urls: set,
+) -> tuple[str, str, list[dict]]:
+    """Scrape a single site+keyword combination. Returns (site, term, jobs)."""
+    try:
+        df: pd.DataFrame = _scrape_with_retries(
+            site=site,
+            term=term,
+            location=location,
+            remote_only=remote_only,
+            indeed_country=indeed_country,
+        )
+        with _url_lock:
+            jobs = _dataframe_to_jobs(df, seen_urls)
+        logger.info("  [%s] '%s' -> %d jobs", site, term, len(jobs))
+        return (site, term, jobs)
+    except Exception as exc:
+        exc_str = str(exc).lower()
+
+        # Check for non-retryable errors
+        if any(err in exc_str for err in NON_RETRYABLE_ERRORS):
+            logger.warning("  [%s] unsupported — skipping: %s", site, exc)
+            return (site, term, [])
+
+        # Check for rate limit errors
+        if any(err in exc_str for err in RATE_LIMIT_ERRORS):
+            logger.warning("  [%s] rate-limited", site)
+            return (site, term, [])
+
+        logger.exception("jobspy failed for site='%s' term='%s' — skipping", site, term)
+        return (site, term, [])
+
+
+def _collect_jobspy(config: dict) -> list[dict]:
+    """Fetch from job sites via the jobspy library using parallel execution."""
     keywords: list[str] = config.get("keywords", [])
     location: str = config.get("location", "")
     remote_only: bool = config.get("remote_only", False)
@@ -180,58 +224,32 @@ def _collect_jobspy(config: dict) -> list[dict]:
 
     indeed_country = _resolve_indeed_country(location)
 
-    combined: list[dict] = []
-    seen_urls: set[str] = set()
-    glassdoor_blocked = False
-
+    # Build list of (site, keyword) pairs to scrape
+    tasks = []
     for site in sites:
-        for i, term in enumerate(keywords):
-            if i > 0:
-                time.sleep(3)
+        for term in keywords:
+            tasks.append((site, term))
 
-            if site == "glassdoor" and glassdoor_blocked:
-                logger.info("  [glassdoor] '%s' -> skipped (rate-limited)", term)
-                continue
+    seen_urls: set[str] = set()
+    combined: list[dict] = []
 
+    # Execute in parallel with limited workers
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _scrape_single_job,
+                site, term, location, remote_only, indeed_country, seen_urls
+            ): (site, term)
+            for site, term in tasks
+        }
+
+        for future in as_completed(futures):
+            site, term = futures[future]
             try:
-                df: pd.DataFrame = _scrape_with_retries(
-                    site=site,
-                    term=term,
-                    location=location,
-                    remote_only=remote_only,
-                    indeed_country=indeed_country,
-                )
-                jobs = _dataframe_to_jobs(df, seen_urls)
-                logger.info("  [%s] '%s' -> %d jobs", site, term, len(jobs))
+                _site, _term, jobs = future.result()
                 combined.extend(jobs)
-            except Exception as exc:
-                exc_str = str(exc).lower()
-
-                # Check for non-retryable errors (unsupported country, etc.)
-                if any(err in exc_str for err in NON_RETRYABLE_ERRORS):
-                    logger.warning(
-                        "  [%s] unsupported — skipping: %s", site, exc
-                    )
-                    # Mark site as blocked to skip remaining keywords
-                    if site == "glassdoor":
-                        glassdoor_blocked = True
-                    continue
-
-                # Check for rate limit errors (429, etc.) - block site for remaining keywords
-                if any(err in exc_str for err in RATE_LIMIT_ERRORS):
-                    logger.warning(
-                        "  [%s] rate-limited — skipping remaining keywords", site
-                    )
-                    if site == "glassdoor":
-                        glassdoor_blocked = True
-                        time.sleep(GLASSDOOR_BACKOFF_DELAY)
-                    continue
-
-                logger.exception(
-                    "jobspy failed for site='%s' term='%s' — skipping", site, term
-                )
-
-        time.sleep(5)  # pause between sites to reduce rate limiting
+            except Exception:
+                logger.exception("Task failed for %s/%s", site, term)
 
     return combined
 

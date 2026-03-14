@@ -323,14 +323,27 @@ def _deduplicate_jobs(jobs: list[dict], sent_urls: set[str]) -> list[dict]:
     return new_jobs
 
 
-def _parse_notify_channels(raw: str) -> list[str]:
-    """Parse comma-separated notify channels, validating each."""
+def _parse_notify_channels(raw: str, config: dict) -> list[str]:
+    """Parse comma-separated notify channels, validating each.
+
+    Also automatically adds discord as fallback if discord_webhook_url is configured.
+    """
     channels = [c.strip().lower() for c in raw.split(",") if c.strip()]
     invalid = [c for c in channels if c not in VALID_CHANNELS]
     if invalid:
         logger.error("Invalid notify channels: %s. Valid: %s", invalid, sorted(VALID_CHANNELS))
         sys.exit(1)
-    return channels or ["email"]
+
+    # Default to email if nothing specified
+    if not channels:
+        channels = ["email"]
+
+    # Auto-add discord as fallback if webhook URL is configured and not already specified
+    if "discord" not in channels and config.get("discord_webhook_url"):
+        channels.append("discord")
+        logger.info("Auto-added Discord as notification fallback")
+
+    return channels
 
 
 def _validate_channels(channels: list[str], config: dict) -> list[str]:
@@ -411,7 +424,9 @@ def main() -> None:
     logging.root.addHandler(handler)
     logging.root.setLevel(logging.INFO)
 
-    channels = _parse_notify_channels(args.notify)
+    # Load config first so we can check for auto-fallback channels
+    config = load_config()
+    channels = _parse_notify_channels(args.notify, config)
 
     # Print ASCII banner
     print(BANNER)
@@ -426,8 +441,6 @@ def main() -> None:
 
     box_print("\n".join(config_lines), Colors.BLUE)
     print()
-
-    config = load_config()
 
     # --- Early validation (fail fast, not after 17 min) ---
     if args.provider == "anthropic" and not config.get("anthropic_api_key"):

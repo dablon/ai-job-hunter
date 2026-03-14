@@ -22,8 +22,8 @@ MAX_TOKENS = 4096
 MAX_DESCRIPTION_CHARS = 1500
 BATCH_DELAY_SECONDS = 2
 OPENCODE_TIMEOUT = 180  # seconds per batch subprocess call
-MINIMAX_TIMEOUT = 60  # seconds per API call
-MAX_RETRIES = 3
+MINIMAX_TIMEOUT = 90  # seconds per API call
+MAX_RETRIES = 4
 RETRY_BASE_DELAY = 5  # seconds — doubles each retry (5, 10, 20)
 
 
@@ -302,10 +302,10 @@ def _build_hard_constraints(config: dict) -> str:
 
     if config.get("remote_only"):
         lines.append(
-            "- REMOTE WORK REQUIRED: reject ANY job that is on-site, "
-            "hybrid, or requires physical presence. "
-            "Only approve if the job explicitly offers 100% remote work. "
-            "When in doubt, REJECT."
+            "- REMOTE WORK: If the job says 'remote' or 'work from anywhere' or has no location, "
+            "ASSUME it's remote. Only reject if it explicitly says 'on-site', 'hybrid', "
+            "'in-office', or 'must work from [city]'. "
+            "If location is empty or says 'remote worldwide' — APPROVE."
         )
 
     location = config.get("location", "").strip()
@@ -325,18 +325,19 @@ def _build_hard_constraints(config: dict) -> str:
 SYSTEM_PROMPT = (
     "You are a helpful job-matching assistant. Respond ONLY with a JSON object — "
     "no markdown, no explanation, no text before or after the JSON.\n\n"
-    "APPROVE a job if there's a reasonable chance the user could land it. "
-    "Be slightly generous — if it looks like a fit, include it.\n\n"
-    "REJECT jobs that:\n"
-    "- The user clearly lacks critical skills or years of experience explicitly required\n"
-    "- Are sponsored/promoted listings or reposts with minimal content\n"
-    "- Have wrong seniority level (e.g. requires intern/junior when user is Principal level)\n"
-    "- Require a tech stack the user has never worked with\n"
-    "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
-    "- Are in the wrong language or require relocation\n"
-    "- Are in a location the user does not live except for remote positions\n"
-    "The 'reason' field must explain WHY the job could be a good match. "
-    "If there are minor concerns, note them but APPROVE anyway — let the user decide.\n\n"
+    "APPROVE a job if there's ANY reasonable chance the user could land it. "
+    "Be VERY generous — if there's a fit, include it. Don't be overly picky.\n\n"
+    "REJECT only if:\n"
+    "- The job explicitly requires on-site or hybrid work (not remote)\n"
+    "- The job requires a location the user cannot work from AND is not remote\n"
+    "- The job requires a language the user doesn't speak\n\n"
+    "DO NOT REJECT for:\n"
+    "- Seniority mismatch (a Principal can do Staff/Senior roles)\n"
+    "- Different but related tech stack (if they know .NET, accept Java/Python jobs too)\n"
+    "- Missing years of experience — if they have 20 years, they can do anything\n"
+    "- Vague or missing location — assume remote if not stated\n"
+    "- Promoted/sponsored listings — still worth showing\n\n"
+    "The 'reason' field must explain WHY the job could be a good match.\n\n"
     'Required format: {"approved": [{"job_index": 0, "reason": "reason in English"}]}\n'
     'If nothing matches: {"approved": []}'
 )
@@ -369,16 +370,12 @@ def _build_job_filter_prompt(
         "IMPORTANT: Your response must be ONLY a valid JSON object. "
         "No markdown, no explanation, no text before or after the JSON.\n\n"
         "Task: Evaluate the job postings below against the user's profile. "
-        "APPROVE a job if there's a reasonable chance the user could land it. "
-        "Be slightly generous — if it looks like a fit, include it.\n\n"
-        "REJECT jobs that:\n"
-        "- The user clearly lacks critical skills or years of experience explicitly required\n"
-        "- Are sponsored/promoted listings or reposts with minimal content\n"
-        "- Have wrong seniority level or wrong tech stack\n"
-        "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
-        "- Are in the wrong language or require relocation\n\n"
-        "The 'reason' field must explain WHY the job could be a good match. "
-        "If there are minor concerns, note them but APPROVE anyway — let the user decide.\n\n"
+        "APPROVE any job that could possibly be a fit. Be VERY generous.\n\n"
+        "Only REJECT if:\n"
+        "- Job explicitly requires on-site or hybrid (not remote)\n"
+        "- Job is in wrong language or requires relocation you can't do\n\n"
+        "DO NOT reject for: seniority mismatch, different tech stack, missing years of experience, "
+        "vague location, or promoted listings.\n\n"
         "Required JSON format:\n"
         '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
         'If nothing matches: {"approved": []}\n\n'
