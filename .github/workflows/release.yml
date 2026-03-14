@@ -39,7 +39,12 @@ jobs:
               LAST_TAG="${LAST_TAG#v}"
               IFS='.' read -r MAJOR MINOR PATCH <<< "$LAST_TAG"
 
-              COMMITS=$(git log --pretty=format:"%s" "$LAST_TAG..HEAD" --no-merges)
+              # Check if we have commits since last tag
+              if git rev-parse "v$LAST_TAG" >/dev/null 2>&1; then
+                COMMITS=$(git log --pretty=format:"%s" "v$LAST_TAG..HEAD" --no-merges 2>/dev/null || echo "")
+              else
+                COMMITS=""
+              fi
 
               if echo "$COMMITS" | grep -qiE "^(feat|feature)[:\(]"; then
                 BUMP="minor"
@@ -56,10 +61,12 @@ jobs:
               esac
 
               VERSION="$MAJOR.$MINOR.$PATCH"
+              IS_NEW="true"
             else
+              # First release
               VERSION="1.0.0"
+              IS_NEW="true"
             fi
-            IS_NEW="true"
           fi
 
           echo "version=v$VERSION" >> $GITHUB_OUTPUT
