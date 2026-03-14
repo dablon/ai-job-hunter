@@ -132,8 +132,22 @@ Focus on: tech stack, seniority level, industry fit, and role types."""
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
-        
-        result = json.loads(content)
+
+        # Try to find valid JSON in the response
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            # Try to extract JSON object from potentially corrupted response
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                content = content[start:end+1]
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError:
+                    raise ValueError(f"Could not parse JSON from response: {content[:200]}...")
+            else:
+                raise ValueError(f"No JSON object found in response: {content[:200]}...")
         
         refined_config = config.copy()
         refined_config["profile"] = result.get("refined_profile", profile)
@@ -309,24 +323,77 @@ def _build_hard_constraints(config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You are a strict job-matching assistant. Respond ONLY with a JSON object — "
+    "You are a helpful job-matching assistant. Respond ONLY with a JSON object — "
     "no markdown, no explanation, no text before or after the JSON.\n\n"
-    "APPROVE a job ONLY if the user clearly meets ALL of its stated requirements.\n"
-    "When in doubt, REJECT.\n\n"
+    "APPROVE a job if there's a reasonable chance the user could land it. "
+    "Be slightly generous — if it looks like a fit, include it.\n\n"
     "REJECT jobs that:\n"
-    "- The user lacks any required skill, technology, or experience listed in the posting\n"
+    "- The user clearly lacks critical skills or years of experience explicitly required\n"
     "- Are sponsored/promoted listings or reposts with minimal content\n"
-    "- Have wrong seniority level (e.g. requires senior when user is mid-level)\n"
-    "- Require a tech stack the user does not have\n"
+    "- Have wrong seniority level (e.g. requires intern/junior when user is Principal level)\n"
+    "- Require a tech stack the user has never worked with\n"
     "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
     "- Are in the wrong language or require relocation\n"
-    "- Are in a location the user does not live except for remote positions, "
-    "or if the user explicitly said they are open to relocation\n"
-    "The 'reason' field must explain only WHY the job IS a good match. "
-    "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
+    "- Are in a location the user does not live except for remote positions\n"
+    "The 'reason' field must explain WHY the job could be a good match. "
+    "If there are minor concerns, note them but APPROVE anyway — let the user decide.\n\n"
     'Required format: {"approved": [{"job_index": 0, "reason": "reason in English"}]}\n'
     'If nothing matches: {"approved": []}'
 )
+
+
+def _build_job_filter_prompt(
+    profile: str,
+    constraints: str,
+    jobs_text: str,
+    include_system_in_user: bool = True,
+) -> tuple[str, str]:
+    """Build system and user prompts for job filtering.
+
+    Args:
+        profile: User's profile text
+        constraints: Hard constraints string
+        jobs_text: Formatted job listings
+        include_system_in_user: If True, include system prompt in user message (for Minimax)
+
+    Returns:
+        Tuple of (system_prompt, user_prompt)
+    """
+    hard_constraints_section = (
+        f"\n\nHARD CONSTRAINTS (non-negotiable — REJECT if violated):\n{constraints}"
+        if constraints
+        else ""
+    )
+
+    user_prompt = (
+        "IMPORTANT: Your response must be ONLY a valid JSON object. "
+        "No markdown, no explanation, no text before or after the JSON.\n\n"
+        "Task: Evaluate the job postings below against the user's profile. "
+        "APPROVE a job if there's a reasonable chance the user could land it. "
+        "Be slightly generous — if it looks like a fit, include it.\n\n"
+        "REJECT jobs that:\n"
+        "- The user clearly lacks critical skills or years of experience explicitly required\n"
+        "- Are sponsored/promoted listings or reposts with minimal content\n"
+        "- Have wrong seniority level or wrong tech stack\n"
+        "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
+        "- Are in the wrong language or require relocation\n\n"
+        "The 'reason' field must explain WHY the job could be a good match. "
+        "If there are minor concerns, note them but APPROVE anyway — let the user decide.\n\n"
+        "Required JSON format:\n"
+        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
+        'If nothing matches: {"approved": []}\n\n'
+        f"## User Profile\n{profile}"
+        f"{hard_constraints_section}\n\n"
+        f"## Jobs to Evaluate\n{jobs_text}\n\n"
+        "Respond with ONLY the JSON object."
+    )
+
+    if include_system_in_user:
+        # For Minimax/opencode: embed system in user prompt
+        return ("", user_prompt)
+
+    # For Anthropic: separate system and user prompts
+    return (SYSTEM_PROMPT, user_prompt)
 
 
 def _build_user_prompt(profile: str, constraints: str, jobs_text: str) -> str:
@@ -414,40 +481,13 @@ def _filter_batch_minimax(
 ) -> FilterResult:
     """Call Minimax API and parse the JSON response."""
     jobs_text = _format_jobs_for_prompt(batch)
-
-    hard_constraints_section = (
-        f"\n\nHARD CONSTRAINTS (non-negotiable — REJECT if violated):\n{constraints}\n"
-        if constraints
-        else ""
-    )
-
-    # Build prompt for Minimax
-    user_prompt = (
-        "IMPORTANT: Your response must be ONLY a valid JSON object. "
-        "No markdown, no explanation, no text before or after the JSON.\n\n"
-        "Task: Evaluate the job postings below against the user's profile. "
-        "APPROVE a job ONLY if the user clearly meets ALL of its stated requirements. "
-        "When in doubt, REJECT.\n\n"
-        "REJECT jobs that:\n"
-        "- The user lacks any required skill, technology, or experience listed in the posting\n"
-        "- Are sponsored/promoted listings or reposts with minimal content\n"
-        "- Have wrong seniority level or wrong tech stack\n"
-        "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
-        "- Are in the wrong language or require relocation\n\n"
-        "The 'reason' field must explain only WHY the job IS a good match. "
-        "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
-        "Required JSON format:\n"
-        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
-        'If nothing matches: {"approved": []}\n\n'
-        f"## User Profile\n{profile}"
-        f"{hard_constraints_section}\n\n"
-        f"## Jobs to Evaluate\n{jobs_text}\n\n"
-        "Respond with ONLY the JSON object."
+    system_prompt, user_prompt = _build_job_filter_prompt(
+        profile, constraints, jobs_text, include_system_in_user=True
     )
 
     # Minimax API endpoint
     url = "https://api.minimax.io/v1/text/chatcompletion_v2"
-    
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -540,34 +580,8 @@ def _filter_batch_opencode(
 ) -> FilterResult:
     """Call opencode CLI via a temp file and parse the JSON response."""
     jobs_text = _format_jobs_for_prompt(batch)
-
-    hard_constraints_section = (
-        f"\n\nHARD CONSTRAINTS (non-negotiable — REJECT if violated):\n{constraints}\n"
-        if constraints
-        else ""
-    )
-
-    prompt_content = (
-        "IMPORTANT: Your response must be ONLY a valid JSON object. "
-        "No markdown, no explanation, no text before or after the JSON.\n\n"
-        "Task: Evaluate the job postings below against the user's profile. "
-        "APPROVE a job ONLY if the user clearly meets ALL of its stated requirements. "
-        "When in doubt, REJECT.\n\n"
-        "REJECT jobs that:\n"
-        "- The user lacks any required skill, technology, or experience listed in the posting\n"
-        "- Are sponsored/promoted listings or reposts with minimal content\n"
-        "- Have wrong seniority level or wrong tech stack\n"
-        "- Require on-site presence, are hybrid, or do not explicitly offer remote work\n"
-        "- Are in the wrong language or require relocation\n\n"
-        "The 'reason' field must explain only WHY the job IS a good match. "
-        "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
-        "Required JSON format:\n"
-        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
-        'If nothing matches: {"approved": []}\n\n'
-        f"## User Profile\n{profile}"
-        f"{hard_constraints_section}\n\n"
-        f"## Jobs to Evaluate\n{jobs_text}\n\n"
-        "Respond with ONLY the JSON object."
+    _, prompt_content = _build_job_filter_prompt(
+        profile, constraints, jobs_text, include_system_in_user=True
     )
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="jobhunter_")

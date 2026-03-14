@@ -1,6 +1,7 @@
 """collector.py — Fetches job listings from multiple sources."""
 
 import logging
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -10,7 +11,59 @@ from jobspy import scrape_jobs
 
 from job_hunter.utils import retry_with_backoff
 
+# ANSI colors (same as main.py)
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
+
+
+def colorize(text: str, color: str) -> str:
+    """Add color to text if terminal supports it."""
+    if not sys.stdout.isatty():
+        return text
+    return f"{color}{text}{Colors.RESET}"
+
+
 logger = logging.getLogger(__name__)
+
+
+class Spinner:
+    """Thread-safe spinner for collection progress."""
+
+    SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    def __init__(self):
+        self._idx = 0
+
+    def next(self) -> str:
+        """Return next spinner character."""
+        char = self.SPINNER_CHARS[self._idx]
+        self._idx = (self._idx + 1) % len(self.SPINNER_CHARS)
+        return char
+
+
+# Shared spinner instance for progress updates
+_spinner = Spinner()
+
+
+def _spinner() -> str:
+    """Return next spinner character (backwards compatibility wrapper)."""
+    return _spinner.next()
+
+
+def _show_progress(source: str, keyword: str, count: int) -> None:
+    """Show inline progress update."""
+    if sys.stdout.isatty():
+        # Clear line and show progress
+        sys.stdout.write(f"\r  {_spinner()} {source:12} | {keyword:30} | {count:3} jobs")
+        sys.stdout.flush()
 
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 5  # seconds — doubles each retry (5, 10, 20)
@@ -27,6 +80,12 @@ NON_RETRYABLE_ERRORS = {
 RATE_LIMIT_ERRORS = {"429", "rate limit", "too many requests", "503"}
 
 GUPY_API_URL = "https://employability-portal.gupy.io/api/v1/jobs"
+REMOTEOK_API_URL = "https://remoteok.com/api"
+REMOTEOK_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json",
+}
+WEWORKREMOTELY_API_URL = "https://weworkremotely.com/api/v1"
 GUPY_HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -39,6 +98,7 @@ GUPY_HEADERS = {
     ),
 }
 GUPY_LIMIT = 100
+GUPY_MAX_PAGES = 10  # Maximum pages to fetch per keyword to prevent infinite loops
 
 
 def collect_all(config: dict) -> list[dict]:
@@ -52,17 +112,24 @@ def collect_all(config: dict) -> list[dict]:
     collectors = [
         ("jobspy", _collect_jobspy),
         ("gupy", _collect_gupy),
+        ("remoteok", _collect_remoteok),
+        ("weworkremotely", _collect_weworkremotely),
     ]
 
+    print(colorize("  ├─ ", Colors.GRAY) + colorize("jobspy", Colors.BLUE))
     for name, func in collectors:
         try:
             jobs = func(config)
-            logger.info("Source '%s' returned %d jobs", name, len(jobs))
+            # Clear spinner line and show result
+            if sys.stdout.isatty():
+                sys.stdout.write("\r")
+            print(colorize("  │       ", Colors.GRAY) + colorize(f"✓ {name:15} → {len(jobs):3} jobs", Colors.GREEN))
             all_jobs.extend(jobs)
         except Exception:
             logger.exception("Source '%s' failed — skipping", name)
 
-    logger.info("Total collected: %d jobs", len(all_jobs))
+    print(colorize("  │", Colors.GRAY))
+    print(colorize("  └─ ", Colors.GRAY) + colorize(f"Total: {len(all_jobs)} jobs collected", Colors.GREEN + Colors.BOLD))
     return all_jobs
 
 
@@ -195,6 +262,118 @@ def _scrape_with_retries(
 
 
 # ---------------------------------------------------------------------------
+# RemoteOK source
+# ---------------------------------------------------------------------------
+
+
+def _collect_remoteok(config: dict) -> list[dict]:
+    """Fetch jobs from RemoteOK API.
+
+    RemoteOK returns all remote jobs in one call. We filter by keywords.
+    """
+    keywords: list[str] = [k.lower() for k in config.get("keywords", [])]
+    seen_urls: set[str] = set()
+
+    try:
+        resp = requests.get(REMOTEOK_API_URL, headers=REMOTEOK_HEADERS, timeout=30)
+        resp.raise_for_status()
+        raw_jobs: list[dict] = resp.json()
+
+        # First item is usually a tag/info, skip it
+        if raw_jobs and "request" in raw_jobs[0]:
+            raw_jobs = raw_jobs[1:]
+
+        combined: list[dict] = []
+        for raw in raw_jobs:
+            job = _remoteok_job_to_canonical(raw, keywords, seen_urls)
+            if job:
+                combined.append(job)
+
+        return combined
+    except Exception:
+        logger.exception("RemoteOK collection failed")
+        return []
+
+
+def _remoteok_job_to_canonical(
+    raw: dict,
+    keywords: list[str],
+    seen_urls: set[str],
+) -> dict | None:
+    """Convert RemoteOK job to canonical format."""
+    url = raw.get("url", "")
+    if not url:
+        url = f"https://remoteok.com/l/{raw.get('id', '')}"
+    if not url or url in seen_urls:
+        return None
+    seen_urls.add(url)
+
+    # Skip jobs older than 24 hours
+    date_str = raw.get("date", "")
+    if date_str:
+        try:
+            import email.utils
+            parsed = email.utils.parsedate_to_datetime(date_str)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            if parsed.replace(tzinfo=timezone.utc) < cutoff:
+                return None
+        except Exception:
+            pass
+
+    # Check if job matches any keyword
+    title = raw.get("position", "").lower()
+    company = raw.get("company", "").lower()
+    description = raw.get("description", "").lower()
+    tags = " ".join(raw.get("tags", [])).lower()
+
+    search_text = f"{title} {company} {description} {tags}"
+    if keywords and not any(kw in search_text for kw in keywords):
+        return None
+
+    # RemoteOK salary
+    salary_min = raw.get("salary_min")
+    salary_max = raw.get("salary_max")
+    salary = ""
+    if salary_min or salary_max:
+        if salary_min and salary_max:
+            salary = f"${salary_min:,} - ${salary_max:,}"
+        elif salary_min:
+            salary = f"${salary_min:,}+"
+        else:
+            salary = f"Up to ${salary_max:,}"
+
+    return {
+        "id": str(raw.get("id", "")),
+        "title": raw.get("position", ""),
+        "company": raw.get("company", ""),
+        "url": url,
+        "description": raw.get("description", ""),
+        "location": "Remote",
+        "date_posted": date_str[:10] if date_str else "",
+        "source": "remoteok",
+        "salary": salary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WeWorkRemotely source
+# ---------------------------------------------------------------------------
+
+
+def _collect_weworkremotely(config: dict) -> list[dict]:
+    """Fetch jobs from WeWorkRemotely.
+
+    This requires scraping since they don't have a public API.
+    Falls back to jobspy which already covers this site.
+    """
+    # WeWorkRemotely doesn't have a public API, so we rely on jobspy to cover it
+    # This function is here for completeness but just returns empty
+    # since jobspy already queries weworkremotely
+    logger.info("[weworkremotely] covered by jobspy - skipping direct collection")
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Gupy source
 # ---------------------------------------------------------------------------
 
@@ -235,8 +414,9 @@ def _fetch_gupy_keyword(
         params["workplaceTypes"] = "remote"
 
     jobs: list[dict] = []
+    pages_fetched = 0
 
-    while True:
+    while pages_fetched < GUPY_MAX_PAGES:
         resp = requests.get(
             GUPY_API_URL, params=params, headers=GUPY_HEADERS, timeout=30
         )
@@ -256,7 +436,11 @@ def _fetch_gupy_keyword(
             break
 
         params["offset"] += GUPY_LIMIT
+        pages_fetched += 1
         time.sleep(1)
+
+    if pages_fetched >= GUPY_MAX_PAGES:
+        logger.warning("Gupy: reached max pages limit (%d) for keyword '%s'", GUPY_MAX_PAGES, keyword)
 
     return jobs
 

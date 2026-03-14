@@ -22,6 +22,8 @@ SOURCE_COLORS = {
     "indeed": 0x2164F3,
     "glassdoor": 0x0CAA41,
     "gupy": 0xFF6B35,
+    "remoteok": 0x0DAFD4,
+    "weworkremotely": 0x007BFF,
 }
 DEFAULT_SOURCE_COLOR = 0x666666
 
@@ -33,6 +35,8 @@ def source_color_hex(source: str) -> str:
         "indeed": "#2164f3",
         "glassdoor": "#0caa41",
         "gupy": "#ff6b35",
+        "remoteok": "#0dafd4",
+        "weworkremotely": "#007bff",
     }
     return colors.get(source.lower(), "#666666")
 
@@ -67,12 +71,11 @@ def retry_with_backoff(
             return func()
         except retryable as exc:
             # Fail immediately on non-retryable exceptions (ValueError, TypeError, etc.)
-            for non_retry in NON_RETRYABLE_EXCEPTIONS:
-                if isinstance(exc, non_retry):
-                    logger.error(
-                        "[%s] Non-retryable error (skipping retries): %s", context, exc
-                    )
-                    raise exc from None
+            if isinstance(exc, NON_RETRYABLE_EXCEPTIONS):
+                logger.error(
+                    "[%s] Non-retryable error (skipping retries): %s", context, exc
+                )
+                raise exc from None
 
             last_exc = exc
             if attempt < max_retries:

@@ -20,12 +20,164 @@ from job_hunter.notifier_twilio import (
     validate_twilio_config,
 )
 
+# ANSI colors for terminal output
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    ITALIC = "\033[3m"
+    UNDERLINE = "\033[4m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    GRAY = "\033[90m"
+    LIGHT_GREEN = "\033[92m"
+    LIGHT_RED = "\033[91m"
+    LIGHT_YELLOW = "\033[93m"
+    ORANGE = "\033[38;5;208m"
+    PURPLE = "\033[38;5;129m"
+    PINK = "\033[38;5;205m"
+
+
+# ASCII Art and UI Elements
+BANNER = f"""
+{Colors.CYAN}
+    ██████╗ ███████╗ ██████╗ ██╗   ██╗██╗     ███████╗███████╗
+    ██╔══██╗██╔════╝██╔════╝ ██║   ██║██║     ██╔════╝██╔════╝
+    ██████╔╝█████╗   ██║  ███╗██║   ██║██║     █████╗  ███████╗
+    ██╔══██╗██╔══╝   ██║   ██║██║   ██║██║     ██╔══╝  ╚════██║
+    ██║  ██║███████╗ ╚██████╔╝╚██████╔╝███████╗███████╗███████║
+    ╚═╝  ╚═╝╚══════╝  ╚═════╝  ╚═════╝ ╚══════╝╚══════╝╚══════╝
+    {Colors.MAGENTA}╔═══════════════════════════════════════════════════════════╗
+    ║         🤖  AI-POWERED JOB HUNTING PIPELINE v2.0            ║
+    ╚═══════════════════════════════════════════════════════════╝{Colors.RESET}
+"""
+
+# Step icons with ASCII boxes
+STEP_ICONS = {
+    "collect": f"{Colors.CYAN}🔍{Colors.RESET}",
+    "filter": f"{Colors.MAGENTA}🧠{Colors.RESET}",
+    "notify": f"{Colors.GREEN}📨{Colors.RESET}",
+    "profile": f"{Colors.YELLOW}👤{Colors.RESET}",
+}
+
+STEP_TITLES = {
+    "collect": "GATHERING JOB LISTINGS",
+    "filter": "AI-POWERED FILTERING",
+    "notify": "SENDING NOTIFICATIONS",
+    "profile": "PROFILE ANALYSIS",
+}
+
+
+def colorize(text: str, color: str) -> str:
+    """Add color to text if terminal supports it."""
+    if not sys.stdout.isatty():
+        return text
+    return f"{color}{text}{Colors.RESET}"
+
+
+def color_job_count(count: int) -> str:
+    """Colorize job count based on number."""
+    if count == 0:
+        return colorize(str(count), Colors.GRAY)
+    elif count < 5:
+        return colorize(str(count), Colors.YELLOW)
+    elif count < 15:
+        return colorize(str(count), Colors.GREEN)
+    else:
+        return colorize(str(count), Colors.CYAN + Colors.BOLD)
+
+
+def box_print(content: str, color: str = Colors.BLUE, width: int = 58) -> None:
+    """Print content inside an ASCII box."""
+    lines = content.split('\n')
+    print(colorize("┌" + "─" * width + "┐", color))
+    for line in lines:
+        padding = width - len(line)
+        print(colorize("│", color) + " " + line + " " * max(0, padding - 1) + colorize("│", color))
+    print(colorize("└" + "─" * width + "┘", color))
+
+
+def step_box(step_name: str, info: str, status: str = "running") -> None:
+    """Print a step in a styled box."""
+    icon = STEP_ICONS.get(step_name, "▸")
+    title = STEP_TITLES.get(step_name, step_name.upper())
+
+    status_colors = {
+        "running": Colors.CYAN,
+        "done": Colors.GREEN,
+        "warn": Colors.YELLOW,
+        "error": Colors.RED,
+    }
+    status_icon = {
+        "running": "◐",
+        "done": "●",
+        "warn": "⚠",
+        "error": "✖",
+    }
+
+    c = status_colors.get(status, Colors.GRAY)
+    s = status_icon.get(status, "○")
+
+    print()
+    print(colorize("╭" + "─" * 56 + "╮", c))
+    print(colorize(f"│ {icon} {title:^50} {s} │", c))
+    print(colorize("├" + "─" * 56 + "┤", c))
+    for line in info.split('\n'):
+        print(colorize("│ ", c) + line.ljust(56) + colorize(" │", c))
+    print(colorize("╰" + "─" * 56 + "╯", c))
+
+
+def progress_bar(current: int, total: int, prefix: str = "", width: int = 30) -> str:
+    """Generate a simple progress bar string."""
+    if total == 0:
+        return colorize(f"{prefix} [{' ' * width}]", Colors.GRAY)
+    percent = min(current / total, 1.0)
+    filled = int(width * percent)
+    bar = "█" * filled + "░" * (width - filled)
+    return colorize(f"{prefix} [{bar}] {int(percent * 100)}%", Colors.CYAN)
+
+
+def print_stats(label: str, value: str, color: str = Colors.GRAY) -> None:
+    """Print a stat line with label and value."""
+    print(f"  {colorize('▸', color)} {label}: {value}")
+
+
+def print_divider(char: str = "─", color: str = Colors.DIM) -> None:
+    """Print a divider line."""
+    print(colorize(char * 58, color))
+
+
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter that adds colors to log levels."""
+
+    COLORS = {
+        "DEBUG": Colors.GRAY,
+        "INFO": Colors.BLUE,
+        "WARNING": Colors.YELLOW,
+        "ERROR": Colors.RED,
+        "CRITICAL": Colors.RED + Colors.BOLD,
+    }
+
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, Colors.RESET)
+        record.levelname = f"{log_color}{record.levelname}{Colors.RESET}"
+        return super().format(record)
+
+
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "config.json"))
 PENDING_JOBS_PATH = Path(os.environ.get("PENDING_JOBS_PATH", "pending_jobs.json"))
 SENT_URLS_PATH = Path(os.environ.get("SENT_URLS_PATH", "sent_urls.json"))
-MAX_KEYWORDS = 12
+MAX_KEYWORDS = 20
+
+# Default reports directory - configurable via environment variable
+DEFAULT_REPORT_DIR = Path("/app/data/reports")
 
 # Environment variable overrides — used in GitHub Actions (secrets)
 VALID_CHANNELS = {"email", "discord", "telegram", "sms", "whatsapp"}
@@ -107,16 +259,28 @@ def _load_pending() -> list[dict]:
         return []
 
 
-def _save_report(jobs: list[dict]) -> Path:
+def _save_report(jobs: list[dict], provider: str = "minimax") -> Path:
     from datetime import datetime
     from job_hunter.mailer import _build_html, _build_plaintext
 
     date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_dir = Path("/app/data/reports")
-    report_dir.mkdir(exist_ok=True)
 
-    html_content = _build_html(jobs)
-    txt_content = _build_plaintext(jobs)
+    # Allow override via REPORT_DIR env var, with fallback for Docker vs local
+    report_dir_str = os.environ.get("REPORT_DIR", "")
+    if report_dir_str:
+        report_dir = Path(report_dir_str)
+    else:
+        # Check which report directory is available and writable
+        # Priority: Docker default > local ./reports > config/reports
+        if DEFAULT_REPORT_DIR.exists() and os.access(DEFAULT_REPORT_DIR, os.W_OK):
+            report_dir = DEFAULT_REPORT_DIR
+        else:
+            # Fall back to local reports directory
+            report_dir = Path("config/reports")
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    html_content = _build_html(jobs, provider)
+    txt_content = _build_plaintext(jobs, provider)
 
     html_path = report_dir / f"jobs_{date_str}.html"
     txt_path = report_dir / f"jobs_{date_str}.txt"
@@ -238,20 +402,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    # Setup colored logging
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColoredFormatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logging.root.addHandler(handler)
+    logging.root.setLevel(logging.INFO)
 
     channels = _parse_notify_channels(args.notify)
 
-    resume_tag = " (resume)" if args.resume else ""
-    logger.info(
-        "=== Job Hunter pipeline starting [provider: %s, notify: %s%s] ===",
-        args.provider,
-        ",".join(channels),
-        resume_tag,
-    )
+    # Print ASCII banner
+    print(BANNER)
+
+    # Config info box
+    config_lines = [
+        f"Provider: {colorize(args.provider.upper(), Colors.GREEN)}",
+        f"Notify:   {colorize(', '.join(channels), Colors.YELLOW)}",
+    ]
+    if args.resume:
+        config_lines.append(f"Mode:     {colorize('RESUME', Colors.MAGENTA)}")
+
+    box_print("\n".join(config_lines), Colors.BLUE)
+    print()
 
     config = load_config()
 
@@ -304,12 +478,17 @@ def main() -> None:
             sys.exit(1)
 
         # Step 1: Collect jobs from all sources
-        logger.info("--- Step 1: Collecting jobs ---")
+        keywords = config.get("keywords", [])
+        step_box("collect", f"Searching {len(keywords)} keywords\nSources: LinkedIn, Indeed, Glassdoor, Gupy, RemoteOK", "running")
+
         jobs = collect_all(config)
 
         if not jobs:
-            logger.info("No jobs collected from any source. Exiting.")
+            step_box("collect", "No jobs found from any source", "warn")
             return
+
+        # Show collection summary with color
+        step_box("collect", f"Successfully collected {color_job_count(len(jobs))} jobs", "done")
 
         _save_pending(jobs)
 
@@ -318,29 +497,34 @@ def main() -> None:
     jobs = _deduplicate_jobs(jobs, sent_urls)
 
     if not jobs:
-        logger.info("All collected jobs were already sent in previous runs. Exiting.")
+        step_box("collect", "All collected jobs were already sent in previous runs", "warn")
         return
 
     # Step 2: AI filtering
-    logger.info("--- Step 2: AI filtering (%d jobs) [%s] ---", len(jobs), args.provider)
+    filter_info = f"Processing {len(jobs)} jobs\nAI Provider: {colorize(args.provider.upper(), Colors.GREEN)}"
+    step_box("filter", filter_info, "running")
+
     try:
         approved_jobs = filter_jobs(jobs, config, provider=args.provider)
     except RuntimeError:
-        logger.error("AI filtering failed. Run with --resume to retry without re-collecting.")
+        step_box("filter", "AI filtering failed. Run with --resume to retry.", "error")
         sys.exit(1)
 
     if not approved_jobs:
-        logger.info("No jobs passed AI filter.")
+        step_box("filter", "No jobs passed the AI filter", "warn")
         return
 
-    # Step 3: Send notifications
-    logger.info(
-        "--- Step 3: Sending notifications [%s] (%d approved jobs) ---",
-        ",".join(viable_channels) or "none",
-        len(approved_jobs),
-    )
+    # Show filtering results
+    pass_rate = (len(approved_jobs)/len(jobs)*100) if jobs else 0
+    filter_result = f"Approved {color_job_count(len(approved_jobs))} jobs\nPass rate: {colorize(f'{pass_rate:.1f}%', Colors.GREEN)}"
+    step_box("filter", filter_result, "done")
 
-    report_path = _save_report(approved_jobs)
+    # Step 3: Send notifications
+    ch_str = colorize(", ".join(viable_channels), Colors.YELLOW) if viable_channels else colorize("none", Colors.GRAY)
+    notify_info = f"Channels: {ch_str}\nJobs to send: {color_job_count(len(approved_jobs))}"
+    step_box("notify", notify_info, "running")
+
+    report_path = _save_report(approved_jobs, args.provider)
     succeeded = _send_notifications(viable_channels, approved_jobs, config, report_path)
 
     # Track sent URLs for deduplication
@@ -350,11 +534,30 @@ def main() -> None:
             sent_urls.add(url)
     _save_sent_urls(sent_urls)
 
-    logger.info(
-        "=== Pipeline complete: %d jobs, notified via: %s ===",
-        len(approved_jobs),
-        ",".join(succeeded) if succeeded else "report only",
-    )
+    # Final completion with fancy ASCII
+    print()
+    print(colorize("╔" + "═" * 56 + "╗", Colors.GREEN))
+    print(colorize("║", Colors.GREEN) + colorize(" 🎉 HUNT COMPLETE! ".center(56), Colors.GREEN + Colors.BOLD) + colorize("║", Colors.GREEN))
+    print(colorize("╠" + "═" * 56 + "╣", Colors.GREEN))
+    print(colorize("║", Colors.GREEN))
+    print(colorize("║", Colors.GREEN) + f"   {colorize(' Jobs Found:', Colors.GRAY)}     {colorize(f'{len(approved_jobs)}', Colors.CYAN + Colors.BOLD)}".ljust(57) + colorize("║", Colors.GREEN))
+    notify_str = colorize(", ".join(succeeded), Colors.YELLOW) if succeeded else colorize("report only", Colors.GRAY)
+    print(colorize("║", Colors.GREEN) + f"   {colorize(' Notified Via:', Colors.GRAY)}    {notify_str}".ljust(57) + colorize("║", Colors.GREEN))
+    print(colorize("║", Colors.GREEN) + f"   {colorize(' Total Sent:', Colors.GRAY)}      {colorize(f'{len(sent_urls)}', Colors.GREEN)}".ljust(57) + colorize("║", Colors.GREEN))
+    print(colorize("║", Colors.GREEN))
+    print(colorize("╚" + "═" * 56 + "╝", Colors.GREEN))
+    print()
+
+    # Easter egg
+    if len(approved_jobs) >= 10:
+        print(colorize("   🎊 Amazing haul! You're on fire! 🔥", Colors.YELLOW))
+    elif len(approved_jobs) >= 5:
+        print(colorize("   👍 Solid results! Keep it up!", Colors.GREEN))
+    elif len(approved_jobs) > 0:
+        print(colorize("   💪 Every step counts. Tomorrow brings new opportunities!", Colors.BLUE))
+    else:
+        print(colorize("   💤 No matches this time. The perfect job is just around the corner!", Colors.GRAY))
+    print()
 
 
 if __name__ == "__main__":
