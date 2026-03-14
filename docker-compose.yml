@@ -11,6 +11,7 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - PENDING_JOBS_PATH=/app/data/pending_jobs.json
+      - SENT_URLS_PATH=/app/data/sent_urls.json
     # Run once (for cron scheduling, trigger manually or via CI)
     # To schedule daily runs, use external cron or GitHub Actions
     profiles:
@@ -29,6 +30,7 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - PENDING_JOBS_PATH=/app/data/pending_jobs.json
+      - SENT_URLS_PATH=/app/data/sent_urls.json
     entrypoint: ["/bin/bash"]
     profiles:
       - dev

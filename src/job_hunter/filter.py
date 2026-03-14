@@ -124,6 +124,15 @@ Focus on: tech stack, seniority level, industry fit, and role types."""
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         logger.info(f"AI Profile Analysis response: {content[:200]}...")
         
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
         result = json.loads(content)
         
         refined_config = config.copy()
@@ -315,7 +324,7 @@ SYSTEM_PROMPT = (
     "or if the user explicitly said they are open to relocation\n"
     "The 'reason' field must explain only WHY the job IS a good match. "
     "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
-    'Required format: {"approved": [{"job_index": 0, "reason": "reason in Portuguese"}]}\n'
+    'Required format: {"approved": [{"job_index": 0, "reason": "reason in English"}]}\n'
     'If nothing matches: {"approved": []}'
 )
 
@@ -428,7 +437,7 @@ def _filter_batch_minimax(
         "The 'reason' field must explain only WHY the job IS a good match. "
         "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
         "Required JSON format:\n"
-        '{"approved": [{"job_index": 0, "reason": "reason in English or Spanish"}, ...]}\n'
+        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
         'If nothing matches: {"approved": []}\n\n'
         f"## User Profile\n{profile}"
         f"{hard_constraints_section}\n\n"
@@ -553,7 +562,7 @@ def _filter_batch_opencode(
         "The 'reason' field must explain only WHY the job IS a good match. "
         "Never mention missing skills or caveats in reason — if there are any, REJECT instead.\n\n"
         "Required JSON format:\n"
-        '{"approved": [{"job_index": 0, "reason": "reason in Portuguese"}, ...]}\n'
+        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
         'If nothing matches: {"approved": []}\n\n'
         f"## User Profile\n{profile}"
         f"{hard_constraints_section}\n\n"
@@ -622,7 +631,7 @@ def _format_jobs_for_prompt(batch: list[dict]) -> str:
     lines = []
     for i, job in enumerate(batch):
         title = str(job.get("title", "Unknown"))[:100]
-        company = str(job.get("company_name", "Unknown"))[:50]
+        company = str(job.get("company", "Unknown"))[:50]
         location = str(job.get("location", "Unknown"))[:50]
         description = str(job.get("description", ""))[:MAX_DESCRIPTION_CHARS]
         url = job.get("url", "")

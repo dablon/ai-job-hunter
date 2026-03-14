@@ -3,6 +3,7 @@
 import html
 import logging
 import smtplib
+import socket
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -27,14 +28,46 @@ def source_color_hex(source: str) -> str:
     return SOURCE_COLORS.get(source.lower(), "#666666")
 
 
+def validate_smtp_config(config: dict) -> bool:
+    """Validate SMTP configuration early, before the pipeline runs.
+
+    Checks that required fields exist and that the SMTP server is reachable.
+    Returns True if valid, False otherwise (logs warnings).
+    """
+    for key in ("email_sender", "email_app_password", "email_recipient"):
+        if not config.get(key):
+            logger.warning("Missing email config: %s — email will be skipped", key)
+            return False
+
+    smtp_host = config.get("smtp_host", "smtp.gmail.com")
+    smtp_port = int(config.get("smtp_port", "587"))
+
+    try:
+        sock = socket.create_connection((smtp_host, smtp_port), timeout=10)
+        sock.close()
+        logger.info("SMTP reachable: %s:%d", smtp_host, smtp_port)
+        return True
+    except OSError as exc:
+        logger.warning(
+            "SMTP server unreachable (%s:%d): %s — email will be skipped",
+            smtp_host, smtp_port, exc,
+        )
+        return False
+
+
 def send_jobs_email(jobs: list[dict], config: dict) -> None:
-    """Build an HTML email from approved jobs and send via Gmail SMTP.
+    """Build an HTML email from approved jobs and send via SMTP.
 
     Raises RuntimeError if sending fails.
     """
     sender = config["email_sender"]
     password = config["email_app_password"]
     recipient = config["email_recipient"]
+
+    smtp_host = config.get("smtp_host", "smtp.gmail.com")
+    smtp_port = int(config.get("smtp_port", "587"))
+    smtp_user = config.get("smtp_user", sender)
+    smtp_password = config.get("smtp_password", password)
 
     date_str = datetime.now().strftime("%d/%m/%Y")
     subject = f"Job Hunter — {len(jobs)} jobs found ({date_str})"
@@ -47,10 +80,17 @@ def send_jobs_email(jobs: list[dict], config: dict) -> None:
     msg.attach(MIMEText(_build_html(jobs), "html", "utf-8"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, [recipient], msg.as_string())
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
+                server.login(smtp_user, smtp_password)
+                server.sendmail(sender, [recipient], msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.sendmail(sender, [recipient], msg.as_string())
         logger.info("Email sent to %s (%d jobs)", recipient, len(jobs))
     except Exception as exc:
         logger.exception("Failed to send email")
@@ -72,9 +112,17 @@ def _build_html(jobs: list[dict]) -> str:
         location = esc(job.get("location", ""))
         url = esc(job.get("url", "#"), quote=True)
         reason = esc(job.get("match_reason", ""))
+        salary = esc(job.get("salary", ""))
         date_posted = job.get("date_posted", "")
         if date_posted and len(date_posted) >= 10:
             date_posted = esc(date_posted[:10])
+
+        salary_html = ""
+        if salary:
+            salary_html = (
+                f'<p style="margin:4px 0;font-size:13px;color:#1a8917;font-weight:bold;">'
+                f'💰 {salary}</p>'
+            )
 
         card = f"""
         <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:16px;background:#ffffff;">
@@ -87,6 +135,7 @@ def _build_html(jobs: list[dict]) -> str:
             <strong>{company}</strong>
             &nbsp;&mdash;&nbsp;{location}
           </p>
+          {salary_html}
           <p style="margin:4px 0;font-size:12px;color:#888;">
             <span style="background:{color};color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;">{source_label}</span>
             &nbsp; Posted: {date_posted or 'N/A'}
@@ -127,11 +176,14 @@ def _build_plaintext(jobs: list[dict]) -> str:
         "",
     ]
     for i, job in enumerate(jobs, 1):
+        company = job.get("company", "Unknown")
         lines += [
-            f"{i}. {job.get('title', '')} @ {job.get('company', '')}",
+            f"{i}. {job.get('title', '')} @ {company}",
             f"   Location: {job.get('location', '')}",
-            f"   Link: {job.get('url', '')}",
         ]
+        if job.get("salary"):
+            lines.append(f"   Salary: {job['salary']}")
+        lines.append(f"   Link: {job.get('url', '')}")
         if job.get("match_reason"):
             lines.append(f"   Reason: {job['match_reason']}")
         lines.append("")

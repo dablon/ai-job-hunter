@@ -69,6 +69,10 @@ def _build_embed(job: dict) -> dict:
         {"name": "Source", "value": source.capitalize() or "N/A", "inline": True},
     ]
 
+    salary = job.get("salary", "")
+    if salary:
+        fields.append({"name": "Salary", "value": salary, "inline": True})
+
     reason = job.get("match_reason", "")
     if reason:
         if len(reason) > EMBED_DESC_MAX_CHARS:

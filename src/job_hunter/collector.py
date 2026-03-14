@@ -60,6 +60,30 @@ def collect_all(config: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+GLASSDOOR_BACKOFF_DELAY = 15  # seconds after a 429
+
+# Map config location to indeed country codes
+INDEED_COUNTRY_MAP = {
+    "colombia": "Colombia",
+    "brazil": "Brazil",
+    "brasil": "Brazil",
+    "argentina": "Argentina",
+    "chile": "Chile",
+    "mexico": "Mexico",
+    "méxico": "Mexico",
+    "usa": "USA",
+    "united states": "USA",
+    "canada": "Canada",
+    "uk": "UK",
+    "united kingdom": "UK",
+}
+
+
+def _resolve_indeed_country(location: str) -> str:
+    """Map a config location string to an Indeed country code."""
+    return INDEED_COUNTRY_MAP.get(location.strip().lower(), location)
+
+
 def _collect_jobspy(config: dict) -> list[dict]:
     """Fetch from job sites via the jobspy library.
 
@@ -69,28 +93,43 @@ def _collect_jobspy(config: dict) -> list[dict]:
     location: str = config.get("location", "")
     remote_only: bool = config.get("remote_only", False)
     sites: list[str] = ["linkedin", "indeed", "glassdoor"]
+    indeed_country = _resolve_indeed_country(location)
 
     combined: list[dict] = []
     seen_urls: set[str] = set()
+    glassdoor_blocked = False
 
     for site in sites:
         for i, term in enumerate(keywords):
             if i > 0:
                 time.sleep(3)
+
+            if site == "glassdoor" and glassdoor_blocked:
+                logger.info("  [glassdoor] '%s' -> skipped (rate-limited)", term)
+                continue
+
             try:
                 df: pd.DataFrame = _scrape_with_retries(
                     site=site,
                     term=term,
                     location=location,
                     remote_only=remote_only,
+                    indeed_country=indeed_country,
                 )
                 jobs = _dataframe_to_jobs(df, seen_urls)
                 logger.info("  [%s] '%s' -> %d jobs", site, term, len(jobs))
                 combined.extend(jobs)
-            except Exception:
-                logger.exception(
-                    "jobspy failed for site='%s' term='%s' — skipping", site, term
-                )
+            except Exception as exc:
+                if site == "glassdoor" and "429" in str(exc):
+                    logger.warning(
+                        "  [glassdoor] 429 rate-limited — skipping remaining keywords"
+                    )
+                    glassdoor_blocked = True
+                    time.sleep(GLASSDOOR_BACKOFF_DELAY)
+                else:
+                    logger.exception(
+                        "jobspy failed for site='%s' term='%s' — skipping", site, term
+                    )
 
         time.sleep(5)  # pause between sites to reduce rate limiting
 
@@ -98,7 +137,11 @@ def _collect_jobspy(config: dict) -> list[dict]:
 
 
 def _scrape_with_retries(
-    site: str, term: str, location: str, remote_only: bool
+    site: str,
+    term: str,
+    location: str,
+    remote_only: bool,
+    indeed_country: str = "Colombia",
 ) -> pd.DataFrame:
     """Call scrape_jobs with retry logic. Raises on exhausted retries."""
     return retry_with_backoff(
@@ -106,7 +149,7 @@ def _scrape_with_retries(
             site_name=[site],
             search_term=term,
             location=location,
-            country_indeed="Brazil",
+            country_indeed=indeed_country,
             results_wanted=25,
             hours_old=24,
             is_remote=remote_only,
@@ -213,6 +256,18 @@ def _gupy_job_to_canonical(
         f"{city}, {state}".strip(", ") if city or state else raw.get("country") or ""
     )
 
+    # Gupy salary
+    salary = ""
+    salary_from = raw.get("salaryFrom")
+    salary_to = raw.get("salaryTo")
+    if salary_from or salary_to:
+        if salary_from and salary_to:
+            salary = f"BRL {int(salary_from):,} – {int(salary_to):,}/month"
+        elif salary_from:
+            salary = f"BRL {int(salary_from):,}+/month"
+        else:
+            salary = f"Up to BRL {int(salary_to):,}/month"
+
     return {
         "id": str(raw.get("id", "")),
         "title": raw.get("name", ""),
@@ -222,12 +277,44 @@ def _gupy_job_to_canonical(
         "location": location,
         "date_posted": published.date().isoformat(),
         "source": "gupy",
+        "salary": salary,
     }
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_salary_string(row: pd.Series) -> str:
+    """Build a human-readable salary string from jobspy columns."""
+    min_amt = row.get("min_amount") if "min_amount" in row else None
+    max_amt = row.get("max_amount") if "max_amount" in row else None
+    currency = row.get("currency", "") if "currency" in row else ""
+    interval = row.get("interval", "") if "interval" in row else ""
+
+    if pd.isna(min_amt) and pd.isna(max_amt):
+        return ""
+
+    currency = str(currency or "USD").upper()
+    interval = str(interval or "").lower()
+
+    parts = []
+    if pd.notna(min_amt) and pd.notna(max_amt):
+        min_v, max_v = int(min_amt), int(max_amt)
+        if min_v == max_v:
+            parts.append(f"{currency} {min_v:,}")
+        else:
+            parts.append(f"{currency} {min_v:,} – {max_v:,}")
+    elif pd.notna(min_amt):
+        parts.append(f"{currency} {int(min_amt):,}+")
+    else:
+        parts.append(f"Up to {currency} {int(max_amt):,}")
+
+    if interval:
+        parts.append(f"/{interval}")
+
+    return "".join(parts)
 
 
 def _dataframe_to_jobs(df: pd.DataFrame, seen_urls: set[str]) -> list[dict]:
@@ -242,23 +329,18 @@ def _dataframe_to_jobs(df: pd.DataFrame, seen_urls: set[str]) -> list[dict]:
         title = row.get("title") or ""
         company = row.get("company") or ""
         location = row.get("location") or ""
-
-        # Normalize description field
-        description = ""
-        for field in ["description", "job_posted_at", "date_posted"]:
-            if field in row and pd.notna(row.get(field)):
-                description += str(row.get(field)) + " "
-        description = description.strip()[:5000]
+        description = str(row.get("description", "") or "").strip()[:5000]
 
         job = {
             "id": row.get("id") or url,
             "title": title,
-            "company_name": company,
+            "company": company,
             "url": url,
             "description": description,
             "location": location,
             "date_posted": str(row.get("date_posted", ""))[:10],
             "source": row.get("source", "unknown"),
+            "salary": _build_salary_string(row),
         }
         jobs.append(job)
 
