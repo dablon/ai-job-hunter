@@ -103,12 +103,10 @@ GUPY_LIMIT = 100
 GUPY_MAX_PAGES = 10  # Maximum pages to fetch per keyword to prevent infinite loops
 
 
-def collect_all(config: dict) -> list[dict]:
-    """Fetch jobs from all enabled sources.
-
-    Failures in one source do not block others.
-    Returns combined list of canonical job dicts.
-    """
+def _collect_for_location(config: dict, location: str) -> list[dict]:
+    """Collect jobs for a single location."""
+    location_config = config.copy()
+    location_config["location"] = location
     all_jobs: list[dict] = []
 
     collectors = [
@@ -116,19 +114,81 @@ def collect_all(config: dict) -> list[dict]:
         ("gupy", _collect_gupy),
         ("remoteok", _collect_remoteok),
         ("weworkremotely", _collect_weworkremotely),
+        ("jooble", _collect_jooble),
+        ("remotive", _collect_remotive),
     ]
 
-    print(colorize("  ├─ ", Colors.GRAY) + colorize("jobspy", Colors.BLUE))
     for name, func in collectors:
         try:
-            jobs = func(config)
-            # Clear spinner line and show result
-            if sys.stdout.isatty():
-                sys.stdout.write("\r")
-            print(colorize("  │       ", Colors.GRAY) + colorize(f"✓ {name:15} → {len(jobs):3} jobs", Colors.GREEN))
+            jobs = func(location_config)
+            for job in jobs:
+                job["search_location"] = location
             all_jobs.extend(jobs)
         except Exception:
-            logger.exception("Source '%s' failed — skipping", name)
+            logger.exception("Source '%s' failed for location '%s' — skipping", name, location)
+
+    return all_jobs
+
+
+def collect_all(config: dict) -> list[dict]:
+    """Fetch jobs from all enabled sources and multiple locations.
+
+    Failures in one source do not block others.
+    Returns combined list of canonical job dicts.
+    """
+    # Get locations - support both single location and multiple locations
+    locations = config.get("locations", [config.get("location", "Remote")])
+
+    # Handle legacy single location config
+    if isinstance(locations, str):
+        locations = [locations]
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_locations = []
+    for loc in locations:
+        loc_lower = loc.lower().strip()
+        if loc_lower not in seen:
+            seen.add(loc_lower)
+            unique_locations.append(loc)
+
+    locations = unique_locations
+
+    # Print header
+    print(colorize("  ├─ ", Colors.GRAY) + colorize("jobspy", Colors.BLUE))
+
+    # Single location - use original logic
+    if len(locations) == 1:
+        return _collect_for_location(config, locations[0])
+
+    # Multi-location - collect in parallel
+    all_jobs: list[dict] = []
+    total_by_source: dict[str, int] = {}
+
+    def collect_location(loc: str) -> list[dict]:
+        return _collect_for_location(config, loc)
+
+    with ThreadPoolExecutor(max_workers=min(4, len(locations))) as executor:
+        futures = {executor.submit(collect_location, loc): loc for loc in locations}
+
+        for future in as_completed(futures):
+            location = futures[future]
+            try:
+                jobs = future.result()
+                all_jobs.extend(jobs)
+                # Count by source
+                for job in jobs:
+                    source = job.get("source", "unknown")
+                    total_by_source[source] = total_by_source.get(source, 0) + 1
+                print(colorize("  │       ", Colors.GRAY) +
+                      colorize(f"✓ {location:15} → {len(jobs):3} jobs", Colors.GREEN))
+            except Exception:
+                logger.exception("Location '%s' failed — skipping", location)
+
+    # Print summary by source
+    for source, count in sorted(total_by_source.items()):
+        print(colorize("  │       ", Colors.GRAY) +
+              colorize(f"✓ {source:15} → {count:3} jobs", Colors.GREEN))
 
     print(colorize("  │", Colors.GRAY))
     print(colorize("  └─ ", Colors.GRAY) + colorize(f"Total: {len(all_jobs)} jobs collected", Colors.GREEN + Colors.BOLD))
@@ -151,11 +211,20 @@ INDEED_COUNTRY_MAP = {
     "chile": "Chile",
     "mexico": "Mexico",
     "méxico": "Mexico",
-    "usa": "USA",
-    "united states": "USA",
+    "usa": "usa",
+    "us": "usa",
+    "united states": "usa",
     "canada": "Canada",
-    "uk": "UK",
-    "united kingdom": "UK",
+    "uk": "uk",
+    "united kingdom": "uk",
+    "spain": "Spain",
+    "españa": "Spain",
+    "latin america": "colombia",
+    "latinoamerica": "colombia",
+    "latam": "colombia",
+    "europe": "uk",  # Use UK as proxy for Europe
+    "worldwide": "usa",
+    "remote": "usa",
 }
 
 
@@ -217,7 +286,8 @@ def _collect_jobspy(config: dict) -> list[dict]:
     sites: list[str] = ["linkedin", "indeed", "glassdoor"]
 
     # Glassdoor doesn't support many countries - skip it for unsupported locations
-    GLASSDOOR_UNSUPPORTED = {"colombia", "argentina", "chile", "peru", "mexico", "brazil"}
+    GLASSDOOR_UNSUPPORTED = {"colombia", "argentina", "chile", "peru", "mexico", "brazil",
+                            "latin america", "latinoamerica", "latam", "europe", "worldwide", "remote"}
     if location.lower().strip() in GLASSDOOR_UNSUPPORTED:
         sites.remove("glassdoor")
         logger.info("[glassdoor] skipped — not available for %s", location)
@@ -580,3 +650,233 @@ def _dataframe_to_jobs(df: pd.DataFrame, seen_urls: set[str]) -> list[dict]:
         jobs.append(job)
 
     return jobs
+
+
+# ---------------------------------------------------------------------------
+# Salary Normalization
+# ---------------------------------------------------------------------------
+
+SALARY_CONVERSION_TO_USD = {
+    "USD": 1.0,
+    "US": 1.0,
+    "EUR": 1.10,  # 1 EUR = 1.10 USD
+    "GBP": 1.27,  # 1 GBP = 1.27 USD
+    "COP": 0.00024,  # 1 COP = 0.00024 USD
+    "MXN": 0.058,  # 1 MXN = 0.058 USD
+    "BRL": 0.20,  # 1 BRL = 0.20 USD
+    "CLP": 0.0011,  # 1 CLP = 0.0011 USD
+    "ARS": 0.0012,  # 1 ARS = 0.0012 USD
+    "PEN": 0.27,  # 1 PEN = 0.27 USD
+    "CAD": 0.74,  # 1 CAD = 0.74 USD
+    "AUD": 0.65,  # 1 AUD = 0.65 USD
+}
+
+SALARY_INTERVAL_MULTIPLIER = {
+    "year": 1,
+    "yr": 1,
+    "month": 12,
+    "mo": 12,
+    "week": 52,
+    "wk": 52,
+    "day": 260,  # ~260 working days/year
+    "hour": 2080,  # ~2080 hours/year (40hr * 52wk)
+}
+
+
+def normalize_salary(salary_str: str) -> dict | None:
+    """Parse and normalize salary string to USD/year.
+
+    Returns dict with: {min_usd, max_usd, currency, interval}
+    """
+    if not salary_str or salary_str.strip() == "":
+        return None
+
+    import re
+
+    salary_str = salary_str.upper().strip()
+
+    # Extract currency
+    currency = "USD"
+    for curr in SALARY_CONVERSION_TO_USD:
+        if curr in salary_str:
+            currency = curr
+            break
+
+    # Extract numbers - remove all non-digit characters except dots
+    numbers = re.findall(r"[\d]+(?:\.\d+)?", salary_str)
+    if not numbers:
+        return None
+
+    numbers = [float(n) for n in numbers]
+    min_amount = min(numbers)
+    max_amount = max(numbers) if len(numbers) > 1 else min_amount
+
+    # Extract interval
+    interval = "year"
+    for intv, mult in SALARY_INTERVAL_MULTIPLIER.items():
+        if intv in salary_str.replace(" ", "") or intv.upper() in salary_str:
+            interval = intv
+            break
+
+    # Convert to USD/year
+    rate = SALARY_CONVERSION_TO_USD.get(currency, 1.0)
+    mult = SALARY_INTERVAL_MULTIPLIER.get(interval, 1)
+
+    min_usd = int(min_amount * rate * mult)
+    max_usd = int(max_amount * rate * mult)
+
+    return {
+        "min_usd": min_usd,
+        "max_usd": max_usd,
+        "currency": currency,
+        "interval": interval,
+        "original": salary_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jooble source
+# ---------------------------------------------------------------------------
+
+JOOBLE_API_URL = "https://jooble.org/api"
+
+
+def _collect_jooble(config: dict) -> list[dict]:
+    """Fetch jobs from Jooble API.
+
+    Jooble is a job aggregator with free API.
+    API key can be obtained from jooble.org/api-keys
+    """
+    api_key = config.get("jooble_api_key", "")
+    if not api_key:
+        logger.info("[jooble] API key not configured - skipping")
+        return []
+
+    keywords = config.get("keywords", [])
+    location = config.get("location", "Latin America")
+    remote_only = config.get("remote_only", False)
+
+    # Build location string for Jooble
+    jooble_location = location
+    if remote_only:
+        jooble_location = "Remote"
+
+    seen_urls: set[str] = set()
+    combined: list[dict] = []
+
+    headers = {"Content-Type": "application/json"}
+
+    for keyword in keywords:
+        try:
+            payload = {
+                "keywords": keyword,
+                "location": jooble_location,
+                "page": 1,
+                "pagesize": 20,
+            }
+
+            response = requests.post(
+                f"{JOOBLE_API_URL}/{api_key}",
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                logger.warning("[jooble] API returned status %s", response.status_code)
+                continue
+
+            data = response.json()
+            jobs = data.get("jobs", [])
+
+            for raw in jobs:
+                url = raw.get("link", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                job = {
+                    "id": raw.get("id", url),
+                    "title": raw.get("title", ""),
+                    "company": raw.get("company", ""),
+                    "url": url,
+                    "description": raw.get("snippet", ""),
+                    "location": raw.get("location", ""),
+                    "date_posted": raw.get("updated", "")[:10],
+                    "source": "jooble",
+                    "salary": raw.get("salary", ""),
+                }
+                combined.append(job)
+
+            logger.info("  [jooble] '%s' -> %d jobs", keyword, len(jobs))
+
+        except Exception:
+            logger.exception("jooble failed for keyword='%s' — skipping", keyword)
+
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Remotive source
+# ---------------------------------------------------------------------------
+
+REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
+
+
+def _collect_remotive(config: dict) -> list[dict]:
+    """Fetch jobs from Remotive API.
+
+    Remotive has a free API for remote jobs.
+    """
+    keywords = [k.lower() for k in config.get("keywords", [])]
+    remote_only = config.get("remote_only", True)
+
+    if not remote_only:
+        # Remotive is remote-only anyway
+        pass
+
+    seen_urls: set[str] = set()
+    combined: list[dict] = []
+
+    try:
+        response = requests.get(REMOTIVE_API_URL, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        jobs = data.get("jobs", [])
+
+        for raw in jobs:
+            title_lower = raw.get("title", "").lower()
+
+            # Filter by keywords
+            if keywords and not any(k in title_lower for k in keywords):
+                continue
+
+            url = raw.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            # Parse salary
+            salary = raw.get("salary", "")
+
+            job = {
+                "id": raw.get("id", url),
+                "title": raw.get("title", ""),
+                "company": raw.get("company_name", ""),
+                "url": url,
+                "description": raw.get("description", ""),
+                "location": raw.get("candidate_required_location", "Remote"),
+                "date_posted": raw.get("publication_date", "")[:10],
+                "source": "remotive",
+                "salary": salary,
+                "category": raw.get("category", ""),
+            }
+            combined.append(job)
+
+        logger.info("  [remotive] -> %d jobs", len(combined))
+
+    except Exception:
+        logger.exception("remotive failed — skipping")
+
+    return combined

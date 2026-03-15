@@ -5,7 +5,31 @@
     "backend engineer",
     "devops engineer"
   ],
-  "location": "Colombia",
+  "locations": [
+    "Latin America",
+    "Spain",
+    "USA",
+    "Europe"
+  ],
+  "location": "Remote",
   "remote_only": true,
-  "opencode_model": "minimax/MiniMax-M2.5"
+  "opencode_model": "minimax/MiniMax-M2.5",
+
+  "filter_strictness": "loose",
+
+  "exclude_companies": [
+    "Toptal",
+    "Crossover",
+    "Turing"
+  ],
+  "exclude_keywords": [
+    "junior",
+    "internship",
+    "entry level"
+  ],
+
+  "salary_min_usd": 50000,
+  "salary_max_usd": 200000,
+
+  "jooble_api_key": ""
 }

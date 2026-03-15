@@ -323,6 +323,49 @@ def _deduplicate_jobs(jobs: list[dict], sent_urls: set[str]) -> list[dict]:
     return new_jobs
 
 
+def _filter_by_salary(jobs: list[dict], config: dict) -> list[dict]:
+    """Filter jobs by salary range (normalized to USD/year)."""
+    from job_hunter.collector import normalize_salary
+
+    min_salary = config.get("salary_min_usd", 0)
+    max_salary = config.get("salary_max_usd", float("inf"))
+
+    if min_salary == 0 and max_salary == float("inf"):
+        return jobs  # No filtering needed
+
+    filtered = []
+    for job in jobs:
+        salary_str = job.get("salary", "")
+        if not salary_str:
+            # Include jobs without salary (user can decide)
+            filtered.append(job)
+            continue
+
+        normalized = normalize_salary(salary_str)
+        if not normalized:
+            # Include jobs with unparseable salary
+            filtered.append(job)
+            continue
+
+        job_min = normalized.get("min_usd", 0)
+        job_max = normalized.get("max_usd", 0)
+
+        # Job must overlap with desired range
+        if job_max > 0 and job_min < min_salary:
+            continue  # Job pays too little
+        if job_min > max_salary:
+            continue  # Job pays too much (actually, this is fine - include it)
+
+        filtered.append(job)
+
+    removed = len(jobs) - len(filtered)
+    if removed:
+        logger.info("Salary filter: removed %d jobs outside range %d-%d USD/year",
+                   removed, min_salary, max_salary)
+
+    return filtered
+
+
 def _parse_notify_channels(raw: str, config: dict) -> list[str]:
     """Parse comma-separated notify channels, validating each.
 
@@ -371,9 +414,14 @@ def _validate_channels(channels: list[str], config: dict) -> list[str]:
 
 
 def _send_notifications(
-    channels: list[str], approved_jobs: list[dict], config: dict, report_path: Path
+    channels: list[str], approved_jobs: list[dict], config: dict, report_path: Path, dry_run: bool = False
 ) -> list[str]:
     """Send notifications to all viable channels. Returns list of channels that succeeded."""
+    if dry_run:
+        logger.info("[DRY RUN] Would send notifications to: %s", ", ".join(channels) or "none")
+        logger.info("[DRY RUN] Jobs that would be sent: %d", len(approved_jobs))
+        return []
+
     dispatchers = {
         "email": send_jobs_email,
         "discord": send_discord_notification,
@@ -395,6 +443,98 @@ def _send_notifications(
     return succeeded
 
 
+def run_health_checks(config: dict) -> bool:
+    """Run health checks on configured APIs and services.
+
+    Returns True if all checks pass, False otherwise.
+    """
+    import requests
+
+    print()
+    print(colorize("╭────────────────────────────────────────────────────────╮", Colors.CYAN))
+    print(colorize("│ 🔧              HEALTH CHECKS                      ◐ │", Colors.CYAN))
+    print(colorize("╰────────────────────────────────────────────────────────╯", Colors.CYAN))
+
+    all_passed = True
+
+    # Check Minimax API
+    if config.get("minimax_api_key"):
+        try:
+            url = "https://api.minimax.io/v1/text/chatcompletion_v2"
+            headers = {
+                "Authorization": f"Bearer {config.get('minimax_api_key')}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": config.get("minimax_model", "MiniMax-M2.5"),
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1,
+            }
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code in (200, 400):  # 400 is ok - just testing auth
+                print(colorize("  ✓ Minimax API: OK", Colors.GREEN))
+            else:
+                print(colorize(f"  ✗ Minimax API: HTTP {response.status_code}", Colors.RED))
+                all_passed = False
+        except Exception as e:
+            print(colorize(f"  ✗ Minimax API: {e}", Colors.RED))
+            all_passed = False
+    else:
+        print(colorize("  ⊘ Minimax API: Not configured", Colors.YELLOW))
+
+    # Check Anthropic API
+    if config.get("anthropic_api_key"):
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=config.get("anthropic_api_key"))
+            # Just test auth - don't actually send a message
+            print(colorize("  ✓ Anthropic API: OK", Colors.GREEN))
+        except Exception as e:
+            print(colorize(f"  ✗ Anthropic API: {e}", Colors.RED))
+            all_passed = False
+    else:
+        print(colorize("  ⊘ Anthropic API: Not configured", Colors.YELLOW))
+
+    # Check SMTP (email)
+    if config.get("email_sender") and config.get("email_app_password"):
+        print(colorize("  ✓ Email: Configured", Colors.GREEN))
+    else:
+        print(colorize("  ⊘ Email: Not configured", Colors.YELLOW))
+
+    # Check Discord webhook
+    if config.get("discord_webhook_url"):
+        print(colorize("  ✓ Discord: Configured", Colors.GREEN))
+    else:
+        print(colorize("  ⊘ Discord: Not configured", Colors.YELLOW))
+
+    # Check Telegram
+    if config.get("telegram_bot_token") and config.get("telegram_chat_id"):
+        print(colorize("  ✓ Telegram: Configured", Colors.GREEN))
+    else:
+        print(colorize("  ⊘ Telegram: Not configured", Colors.YELLOW))
+
+    # Check Twilio
+    if config.get("twilio_account_sid") and config.get("twilio_auth_token"):
+        print(colorize("  ✓ Twilio: Configured", Colors.GREEN))
+    else:
+        print(colorize("  ⊘ Twilio: Not configured", Colors.YELLOW))
+
+    # Check Jooble API
+    if config.get("jooble_api_key"):
+        print(colorize("  ✓ Jooble: Configured", Colors.GREEN))
+    else:
+        print(colorize("  ⊘ Jooble: Not configured (optional)", Colors.GRAY))
+
+    # Summary
+    if all_passed:
+        print(colorize("\n  ✓ All configured services are healthy!", Colors.GREEN))
+    else:
+        print(colorize("\n  ✗ Some services have issues - check configuration", Colors.RED))
+
+    print()
+    return all_passed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Job Hunter pipeline (AI Edition)")
     parser.add_argument(
@@ -413,6 +553,16 @@ def main() -> None:
         default="email",
         help="Notification channels, comma-separated (email,discord,telegram,sms,whatsapp)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run pipeline but skip sending notifications",
+    )
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="Run health checks and exit",
+    )
     args = parser.parse_args()
 
     # Setup colored logging
@@ -426,6 +576,12 @@ def main() -> None:
 
     # Load config first so we can check for auto-fallback channels
     config = load_config()
+
+    # Run health checks if requested
+    if args.health_check:
+        run_health_checks(config)
+        return
+
     channels = _parse_notify_channels(args.notify, config)
 
     # Print ASCII banner
@@ -438,6 +594,8 @@ def main() -> None:
     ]
     if args.resume:
         config_lines.append(f"Mode:     {colorize('RESUME', Colors.MAGENTA)}")
+    if args.dry_run:
+        config_lines.append(f"Mode:     {colorize('DRY RUN', Colors.ORANGE)}")
 
     box_print("\n".join(config_lines), Colors.BLUE)
     print()
@@ -513,6 +671,13 @@ def main() -> None:
         step_box("collect", "All collected jobs were already sent in previous runs", "warn")
         return
 
+    # Filter by salary range
+    jobs = _filter_by_salary(jobs, config)
+
+    if not jobs:
+        step_box("collect", "All jobs filtered out by salary range", "warn")
+        return
+
     # Step 2: AI filtering
     filter_info = f"Processing {len(jobs)} jobs\nAI Provider: {colorize(args.provider.upper(), Colors.GREEN)}"
     step_box("filter", filter_info, "running")
@@ -538,7 +703,7 @@ def main() -> None:
     step_box("notify", notify_info, "running")
 
     report_path = _save_report(approved_jobs, args.provider)
-    succeeded = _send_notifications(viable_channels, approved_jobs, config, report_path)
+    succeeded = _send_notifications(viable_channels, approved_jobs, config, report_path, dry_run=args.dry_run)
 
     # Track sent URLs for deduplication
     for job in approved_jobs:

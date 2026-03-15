@@ -30,6 +30,7 @@ RETRY_BASE_DELAY = 5  # seconds — doubles each retry (5, 10, 20)
 class ApprovedJob(BaseModel):
     job_index: int
     reason: str
+    score: float = 0.0  # Match score 0-100
 
 
 class FilterResult(BaseModel):
@@ -216,8 +217,13 @@ def filter_jobs(
 ) -> list[dict]:
     """Filter jobs using the specified AI provider.
 
-    Returns approved jobs, each enriched with a 'reason' field.
+    Returns approved jobs, each enriched with a 'reason' field and 'match_score'.
     Raises RuntimeError if all batches fail or a permanent error occurs.
+
+    The filter_strictness config option controls how selective the AI is:
+    - "loose": Accept any job that could possibly be a fit (recommended for initial search)
+    - "balanced": Reject jobs with significant mismatches
+    - "strict": Only accept jobs with strong matches
     """
     if not jobs:
         logger.info("No jobs to filter")
@@ -226,19 +232,45 @@ def filter_jobs(
     profile = config.get("profile", "")
     constraints = _build_hard_constraints(config)
 
+    # Get strictness level from config
+    strictness = config.get("filter_strictness", "balanced")
+    strictness_instruction = _get_strictness_instruction(strictness)
+
+    # Add strictness to constraints
+    full_constraints = f"{constraints}\n{strictness_instruction}" if constraints else strictness_instruction
+
     if provider == "opencode":
-        batch_fn = _make_opencode_batch_fn(config, profile, constraints)
+        batch_fn = _make_opencode_batch_fn(config, profile, full_constraints)
         return _filter_in_batches(jobs, batch_fn, provider)
     elif provider == "minimax":
-        batch_fn = _make_minimax_batch_fn(config, profile, constraints)
+        batch_fn = _make_minimax_batch_fn(config, profile, full_constraints)
         return _filter_in_batches(jobs, batch_fn, provider)
     else:
-        batch_fn = _make_anthropic_batch_fn(config, profile, constraints)
+        batch_fn = _make_anthropic_batch_fn(config, profile, full_constraints)
         return _filter_in_batches(
             jobs, batch_fn, provider, abort_on=(anthropic.BadRequestError,)
         )
 
 
+def _get_strictness_instruction(strictness: str) -> str:
+    """Get the AI instruction based on strictness level."""
+    instructions = {
+        "loose": (
+            "FILTER STRICTNESS (LOOSE): Approve any job that has ANY potential fit. "
+            "Even partial matches are worth showing. Don't filter out jobs - let the user decide."
+        ),
+        "balanced": (
+            "FILTER STRICTNESS (BALANCED): Reject only jobs with clear mismatches. "
+            "Consider: skills gap, seniority mismatch, wrong location. "
+            "If there's any reasonable chance, approve it."
+        ),
+        "strict": (
+            "FILTER STRICTNESS (STRICT): Only approve jobs with strong matches. "
+            "Reject if: different tech stack, wrong seniority level, missing key skills. "
+            "Focus on high-quality matches only."
+        ),
+    }
+    return instructions.get(strictness, instructions["balanced"])
 # ---------------------------------------------------------------------------
 # Shared batch loop
 # ---------------------------------------------------------------------------
@@ -315,6 +347,22 @@ def _build_hard_constraints(config: dict) -> str:
             f"Reject on-site jobs outside {location}."
         )
 
+    # Company exclusion list
+    exclude_companies = config.get("exclude_companies", [])
+    if exclude_companies:
+        companies_str = ", ".join([f'"{c}"' for c in exclude_companies])
+        lines.append(
+            f"- EXCLUDED COMPANIES: REJECT jobs from these companies: {companies_str}"
+        )
+
+    # Keyword exclusion list
+    exclude_keywords = config.get("exclude_keywords", [])
+    if exclude_keywords:
+        keywords_str = ", ".join([f'"{k}"' for k in exclude_keywords])
+        lines.append(
+            f"- EXCLUDED KEYWORDS: REJECT jobs containing these keywords: {keywords_str}"
+        )
+
     return "\n".join(lines)
 
 
@@ -330,15 +378,20 @@ SYSTEM_PROMPT = (
     "REJECT only if:\n"
     "- The job explicitly requires on-site or hybrid work (not remote)\n"
     "- The job requires a location the user cannot work from AND is not remote\n"
-    "- The job requires a language the user doesn't speak\n\n"
+    "- The job requires a language the user doesn't speak\n"
+    "- Company is in your exclusion list\n"
+    "- Job contains excluded keywords\n\n"
     "DO NOT REJECT for:\n"
     "- Seniority mismatch (a Principal can do Staff/Senior roles)\n"
     "- Different but related tech stack (if they know .NET, accept Java/Python jobs too)\n"
     "- Missing years of experience — if they have 20 years, they can do anything\n"
     "- Vague or missing location — assume remote if not stated\n"
     "- Promoted/sponsored listings — still worth showing\n\n"
-    "The 'reason' field must explain WHY the job could be a good match.\n\n"
-    'Required format: {"approved": [{"job_index": 0, "reason": "reason in English"}]}\n'
+    "For each approved job, provide:\n"
+    "- job_index: The index of the job\n"
+    "- reason: Explain WHY the job could be a good match\n"
+    "- score: Rate match quality 0-100 (100 = perfect match)\n\n"
+    'Required format: {"approved": [{"job_index": 0, "reason": "reason in English", "score": 85}]}\n'
     'If nothing matches: {"approved": []}'
 )
 
@@ -660,14 +713,18 @@ def _format_jobs_for_prompt(batch: list[dict]) -> str:
 
 
 def _extract_approved(result: FilterResult, batch: list[dict]) -> list[dict]:
-    """Extract approved jobs with their reasons."""
+    """Extract approved jobs with their reasons and scores."""
     approved = []
     for item in result.approved:
         idx = item.job_index
         if 0 <= idx < len(batch):
             job = dict(batch[idx])
             job["match_reason"] = item.reason
+            job["match_score"] = item.score if item.score else 0.0
             approved.append(job)
         else:
             logger.warning("Invalid job_index %d in filter result", idx)
+
+    # Sort by score descending
+    approved.sort(key=lambda x: x.get("match_score", 0), reverse=True)
     return approved
