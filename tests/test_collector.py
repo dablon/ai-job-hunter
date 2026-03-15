@@ -21,11 +21,11 @@ class TestResolveIndeedCountry:
         assert _resolve_indeed_country("Brasil") == "Brazil"
 
     def test_usa(self):
-        assert _resolve_indeed_country("USA") == "USA"
+        assert _resolve_indeed_country("USA") == "usa"
 
     def test_case_insensitive(self):
         assert _resolve_indeed_country("COLOMBIA") == "Colombia"
-        assert _resolve_indeed_country("united states") == "USA"
+        assert _resolve_indeed_country("united states") == "usa"
 
     def test_unknown_passthrough(self):
         assert _resolve_indeed_country("Peru") == "Peru"

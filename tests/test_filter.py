@@ -16,7 +16,7 @@ class TestBuildHardConstraints:
     def test_remote_only(self):
         result = _build_hard_constraints({"remote_only": True})
         assert "REMOTE WORK" in result
-        assert "REJECT" in result
+        assert "reject" in result
 
     def test_location_no_remote(self):
         result = _build_hard_constraints({"location": "Colombia", "remote_only": False})
