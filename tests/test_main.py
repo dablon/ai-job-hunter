@@ -14,16 +14,22 @@ class TestParseNotifyChannels:
     def config(self):
         return {"discord_webhook_url": "https://hooks.example.com"}
 
-    def test_single(self, config):
-        assert _parse_notify_channels("email", config) == ["email", "discord"]
+    def test_single(self):
+        assert _parse_notify_channels("email", {}) == ["email"]
 
     def test_multiple(self, config):
         result = _parse_notify_channels("email,telegram,discord", config)
         assert result == ["email", "telegram", "discord"]
 
-    def test_whitespace(self, config):
-        result = _parse_notify_channels("email , telegram , sms", config)
-        assert result == ["email", "telegram", "sms", "discord"]
+    def test_whitespace(self):
+        result = _parse_notify_channels("email , telegram , sms", {})
+        assert result == ["email", "telegram", "sms"]
+
+    def test_auto_add_discord_fallback(self, config):
+        assert _parse_notify_channels("email", config) == ["email", "discord"]
+
+    def test_discord_not_duplicated(self, config):
+        assert _parse_notify_channels("email,discord", config) == ["email", "discord"]
 
     def test_all_channels(self, config):
         result = _parse_notify_channels("email,discord,telegram,sms,whatsapp", config)
