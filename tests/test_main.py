@@ -10,24 +10,28 @@ from job_hunter.main import _parse_notify_channels, _deduplicate_jobs, _validate
 
 
 class TestParseNotifyChannels:
-    def test_single(self):
-        assert _parse_notify_channels("email") == ["email"]
+    @pytest.fixture
+    def config(self):
+        return {"discord_webhook_url": "https://hooks.example.com"}
 
-    def test_multiple(self):
-        result = _parse_notify_channels("email,telegram,discord")
+    def test_single(self, config):
+        assert _parse_notify_channels("email", config) == ["email"]
+
+    def test_multiple(self, config):
+        result = _parse_notify_channels("email,telegram,discord", config)
         assert result == ["email", "telegram", "discord"]
 
-    def test_whitespace(self):
-        result = _parse_notify_channels("email , telegram , sms")
+    def test_whitespace(self, config):
+        result = _parse_notify_channels("email , telegram , sms", config)
         assert result == ["email", "telegram", "sms"]
 
-    def test_all_channels(self):
-        result = _parse_notify_channels("email,discord,telegram,sms,whatsapp")
+    def test_all_channels(self, config):
+        result = _parse_notify_channels("email,discord,telegram,sms,whatsapp", config)
         assert len(result) == 5
 
-    def test_invalid_exits(self):
+    def test_invalid_exits(self, config):
         with pytest.raises(SystemExit):
-            _parse_notify_channels("email,pigeon")
+            _parse_notify_channels("email,pigeon", config)
 
 
 class TestValidateChannels:
