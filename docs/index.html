@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Job Hunter - Automated Job Hunting Pipeline</title>
+    <meta name="description" content="AI-powered automated job hunting pipeline - find and apply to jobs automatically">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0a0a0f;
+            --bg-card: #12121a;
+            --primary: #6366f1;
+            --primary-glow: rgba(99, 102, 241, 0.3);
+            --text: #e0e0e0;
+            --text-muted: #888;
+            --success: #22c55e;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-dark);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        .hero {
+            text-align: center;
+            padding: 80px 0 60px;
+            position: relative;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--primary-glow) 0%, transparent 70%);
+            z-index: -1;
+        }
+
+        .logo {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 2.5rem;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 10px;
+        }
+
+        .tagline {
+            font-size: 1.3rem;
+            color: var(--text-muted);
+            margin-bottom: 40px;
+        }
+
+        .badge {
+            display: inline-block;
+            background: var(--bg-card);
+            border: 1px solid var(--primary);
+            color: var(--primary);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            margin-bottom: 30px;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 14px 28px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px var(--primary-glow);
+        }
+
+        .btn-secondary {
+            background: var(--bg-card);
+            color: var(--text);
+            border: 1px solid #333;
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--primary);
+        }
+
+        .features {
+            padding: 60px 0;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 40px;
+        }
+
+        .feature-card {
+            background: var(--bg-card);
+            padding: 30px;
+            border-radius: 12px;
+            border: 1px solid #222;
+            transition: border-color 0.3s;
+        }
+
+        .feature-card:hover {
+            border-color: var(--primary);
+        }
+
+        .feature-icon {
+            font-size: 2rem;
+            margin-bottom: 15px;
+        }
+
+        .feature-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .feature-desc {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        .code-section {
+            padding: 60px 0;
+        }
+
+        .code-block {
+            background: var(--bg-card);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #222;
+        }
+
+        .code-header {
+            background: #1a1a24;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid #222;
+        }
+
+        .code-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .code-dot.red { background: #ff5f57; }
+        .code-dot.yellow { background: #febc2e; }
+        .code-dot.green { background: #28c840; }
+
+        .code-title {
+            margin-left: 10px;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        pre {
+            padding: 20px;
+            overflow-x: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+        }
+
+        code { color: var(--primary); }
+        .comment { color: #666; }
+        .string { color: #a5d6ff; }
+        .keyword { color: #ff7b72; }
+
+        .install {
+            padding: 60px 0;
+            text-align: center;
+        }
+
+        .install-code {
+            background: var(--bg-card);
+            padding: 20px 30px;
+            border-radius: 12px;
+            display: inline-block;
+            margin-top: 20px;
+        }
+
+        .install-code code {
+            display: block;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--primary);
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px 0;
+            color: var(--text-muted);
+            border-top: 1px solid #222;
+            margin-top: 60px;
+        }
+
+        footer a {
+            color: var(--primary);
+            text-decoration: none;
+        }
+
+        @media (max-width: 600px) {
+            .logo { font-size: 2rem; }
+            .hero { padding: 50px 0 40px; }
+            .btn { width: 100%; justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <section class="hero">
+            <div class="logo">🤖 AI Job Hunter</div>
+            <p class="tagline">Automated Job Hunting Pipeline - Find and apply to jobs with AI</p>
+            <div class="badge">🤖 AI-Powered • 🔍 Automated • 📄 Smart Applications</div>
+            
+            <div class="buttons">
+                <a href="https://github.com/dablon/ai-job-hunter/releases" class="btn btn-primary">
+                    📥 Download
+                </a>
+                <a href="https://github.com/dablon/ai-job-hunter" class="btn btn-secondary">
+                    ⭐ Star on GitHub
+                </a>
+            </div>
+        </section>
+
+        <section class="features">
+            <h2 style="text-align: center; margin-bottom: 10px;">Why AI Job Hunter?</h2>
+            <p style="text-align: center; color: var(--text-muted);">Automate your job search with the power of AI</p>
+            
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🔍</div>
+                    <div class="feature-title">Smart Job Search</div>
+                    <div class="feature-desc">AI searches job boards automatically based on your keywords and preferences.</div>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">📝</div>
+                    <div class="feature-title">Auto-Apply</div>
+                    <div class="feature-desc">Automatically apply to matching jobs with personalized cover letters.</div>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🤖</div>
+                    <div class="feature-title">AI-Powered</div>
+                    <div class="feature-desc">Uses AI to match your profile with job requirements and optimize applications.</div>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <div class="feature-title">Track Applications</div>
+                    <div class="feature-desc">Keep track of all your applications, interviews, and responses in one place.</div>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🔔</div>
+                    <div class="feature-title">Notifications</div>
+                    <div class="feature-desc">Get notified via email, Discord, or Telegram when new matching jobs appear.</div>
+                </div>
+                
+                <div class="feature-card">
+                    <div class="feature-icon">🌐</div>
+                    <div class="feature-title">Multi-Platform</div>
+                    <div class="feature-desc">Works with multiple job boards and can be deployed anywhere with Docker.</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="code-section">
+            <h2 style="text-align: center; margin-bottom: 30px;">🚀 Quick Start</h2>
+            
+            <div class="code-block">
+                <div class="code-header">
+                    <span class="code-dot red"></span>
+                    <span class="code-dot yellow"></span>
+                    <span class="code-dot green"></span>
+                    <span class="code-title">terminal</span>
+                </div>
+                <pre><code><span class="comment"># Clone the repository</span>
+git clone https://github.com/dablon/ai-job-hunter.git
+cd ai-job-hunter
+
+<span class="comment"># Copy configuration</span>
+cp config.example.json config/config.json
+cp .env.example .env
+
+<span class="comment"># Edit config with your API keys</span>
+<span class="comment"># Then run with Docker</span>
+docker-compose run --rm job-hunter</code></pre>
+            </div>
+        </section>
+
+        <section class="install">
+            <h2 style="margin-bottom: 10px;">📦 Installation</h2>
+            <p style="color: var(--text-muted);">Run locally or in the cloud</p>
+            
+            <div class="install-code">
+                <code># Docker (recommended)</code>
+            </div>
+            <div class="install-code">
+                <code style="margin-top: 10px;">docker-compose up</code>
+            </div>
+        </section>
+
+        <footer>
+            <p>🤖 AI Job Hunter - Built with Python & AI</p>
+            <p style="margin-top: 10px;">
+                <a href="https://github.com/dablon/ai-job-hunter">GitHub</a> • 
+                <a href="https://github.com/dablon/ai-job-hunter/issues">Issues</a> • 
+                <a href="https://github.com/dablon/ai-job-hunter/releases">Releases</a>
+            </p>
+            <p style="margin-top: 20px; font-size: 0.8rem; color: #555;">
+                © 2026 AI Job Hunter. Open source under MIT license.
+            </p>
+        </footer>
+    </div>
+</body>
+</html>
