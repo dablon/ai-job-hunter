@@ -10,6 +10,7 @@ from threading import Lock
 import pandas as pd
 import requests
 from jobspy import scrape_jobs
+from jobspy.model import Country
 
 from job_hunter.utils import retry_with_backoff
 
@@ -205,27 +206,93 @@ def collect_all(config: dict) -> list[dict]:
 
 GLASSDOOR_BACKOFF_DELAY = 15  # seconds after a 429
 
-# Map config location to indeed country codes
+# Map config location to indeed country codes (lowercase keys = jobspy Country enum compatible)
 INDEED_COUNTRY_MAP = {
-    "colombia": "Colombia",
-    "brazil": "Brazil",
-    "brasil": "Brazil",
-    "argentina": "Argentina",
-    "chile": "Chile",
-    "mexico": "Mexico",
-    "méxico": "Mexico",
+    # Valid jobspy countries (lowercase keys)
+    "argentina": "argentina",
+    "australia": "australia",
+    "austria": "austria",
+    "bahrain": "bahrain",
+    "bangladesh": "bangladesh",
+    "belgium": "belgium",
+    "brazil": "brazil",
+    "brasil": "brazil",
+    "canada": "canada",
+    "chile": "chile",
+    "china": "china",
+    "colombia": "colombia",
+    "costa rica": "costa rica",
+    "croatia": "croatia",
+    "cyprus": "cyprus",
+    "czech republic": "czech republic",
+    "czechia": "czechia",
+    "denmark": "denmark",
+    "ecuador": "ecuador",
+    "egypt": "egypt",
+    "estonia": "estonia",
+    "finland": "finland",
+    "france": "france",
+    "germany": "germany",
+    "greece": "greece",
+    "hong kong": "hong kong",
+    "hungary": "hungary",
+    "india": "india",
+    "indonesia": "indonesia",
+    "ireland": "ireland",
+    "israel": "israel",
+    "italy": "italy",
+    "japan": "japan",
+    "kuwait": "kuwait",
+    "latvia": "latvia",
+    "lithuania": "lithuania",
+    "luxembourg": "luxembourg",
+    "malaysia": "malaysia",
+    "malta": "malta",
+    "mexico": "mexico",
+    "morocco": "morocco",
+    "netherlands": "netherlands",
+    "new zealand": "new zealand",
+    "nigeria": "nigeria",
+    "norway": "norway",
+    "oman": "oman",
+    "pakistan": "pakistan",
+    "panama": "panama",
+    "peru": "peru",
+    "philippines": "philippines",
+    "poland": "poland",
+    "portugal": "portugal",
+    "qatar": "qatar",
+    "romania": "romania",
+    "saudi arabia": "saudi arabia",
+    "singapore": "singapore",
+    "slovakia": "slovakia",
+    "slovenia": "slovenia",
+    "south africa": "south africa",
+    "south korea": "south korea",
+    "spain": "spain",
+    "españa": "spain",
+    "sweden": "sweden",
+    "switzerland": "switzerland",
+    "taiwan": "taiwan",
+    "thailand": "thailand",
+    "türkiye": "türkiye",
+    "turkey": "turkey",
+    "ukraine": "ukraine",
+    "united arab emirates": "united arab emirates",
+    "uk": "uk",
+    "united kingdom": "uk",
     "usa": "usa",
     "us": "usa",
     "united states": "usa",
-    "canada": "Canada",
-    "uk": "uk",
-    "united kingdom": "uk",
-    "spain": "Spain",
-    "españa": "Spain",
+    "uruguay": "uruguay",
+    "venezuela": "venezuela",
+    "vietnam": "vietnam",
+    # Aliases
+    "méxico": "mexico",
     "latin america": "colombia",
     "latinoamerica": "colombia",
     "latam": "colombia",
-    "europe": "uk",  # Use UK as proxy for Europe
+    "europe": "uk",
     "worldwide": "usa",
     "remote": "usa",
 }
@@ -370,9 +437,19 @@ def _scrape_with_retries(
     term: str,
     location: str,
     remote_only: bool,
-    indeed_country: str = "Colombia",
+    indeed_country: str = "colombia",
 ) -> pd.DataFrame:
     """Call scrape_jobs with retry logic. Raises on exhausted retries."""
+    # Validate country against jobspy Country enum before calling scrape_jobs
+    # to avoid ValueError crashes for unsupported countries
+    try:
+        Country.from_string(indeed_country.lower())
+    except ValueError:
+        logger.warning(
+            "  [%s] country '%s' not supported by jobspy — skipping",
+            site, indeed_country
+        )
+        return pd.DataFrame()
     return retry_with_backoff(
         lambda: scrape_jobs(
             site_name=[site],

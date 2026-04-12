@@ -194,42 +194,52 @@ DEFAULT_REPORT_DIR = Path("/app/data/reports")
 VALID_CHANNELS = {"email", "discord", "telegram", "sms", "whatsapp"}
 
 # Zone presets for geographic focus — expands to specific locations
+# IMPORTANT: Only use valid jobspy Country enum values (lowercase) to avoid crashes.
+# City names CANNOT be used as country_indeed values — they are passed directly to
+# jobspy's location param which accepts city names for LinkedIn/Indeed city searches.
 ZONE_PRESETS = {
     "latin_america": [
-        "Brazil", "Argentina", "Colombia", "Mexico", "Chile", "Peru",
-        "Ecuador", "Bolivia", "Paraguay", "Uruguay", "Venezuela", "Costa Rica",
-        "Guatemala", "Panama", "Honduras", "El Salvador", "Nicaragua", "Dominican Republic",
-        "Remote Latin America",
+        # Valid jobspy countries only (lowercase for INDEED_COUNTRY_MAP lookup)
+        "argentina", "brazil", "chile", "colombia", "costa rica", "ecuador",
+        "mexico", "panama", "peru", "uruguay", "venezuela",
     ],
     "usa": [
-        "New York", "San Francisco", "Seattle", "Austin", "Boston", "Los Angeles",
-        "Chicago", "Denver", "Atlanta", "Miami", "Washington DC", "Portland",
-        "Remote USA", "Remote",
+        # Country + remote (valid jobspy countries)
+        "usa", "worldwide",
     ],
     "europe": [
-        "London", "Berlin", "Paris", "Amsterdam", "Madrid", "Barcelona", "Milan",
-        "Munich", "Frankfurt", "Dublin", "Zurich", "Vienna", "Prague", "Warsaw",
-        "Remote Europe", "Remote EU",
+        # Valid jobspy European countries
+        "austria", "belgium", "croatia", "cyprus", "czech republic", "denmark",
+        "estonia", "finland", "france", "germany", "greece", "hungary", "ireland",
+        "italy", "latvia", "lithuania", "luxembourg", "malta", "netherlands",
+        "norway", "poland", "portugal", "romania", "slovakia", "slovenia",
+        "spain", "sweden", "switzerland", "uk", "ukraine",
     ],
     "spanish_speakers": [
-        "Spain", "Mexico", "Colombia", "Argentina", "Chile", "Peru", "Madrid",
-        "Barcelona", "Remote Spanish", "Remote Latin America",
+        # Spanish-speaking countries supported by jobspy
+        "argentina", "chile", "colombia", "costa rica", "ecuador", "mexico",
+        "panama", "peru", "spain", "uruguay", "venezuela",
     ],
     "portuguese_speakers": [
-        "Brazil", "Portugal", "Remote Brazil", "Remote Portugal",
+        # Portuguese-speaking countries supported by jobspy
+        "brazil", "portugal",
     ],
     "north_america": [
-        "USA", "Canada", "Mexico", "Remote USA", "Remote Canada",
+        # North American countries supported by jobspy
+        "canada", "mexico", "usa",
     ],
     "asia": [
-        "Singapore", "Japan", "Hong Kong", "South Korea", "Taiwan", "India",
-        "Philippines", "Thailand", "Vietnam", "Malaysia", "Indonesia", "Remote Asia",
+        # Asian countries supported by jobspy
+        "hong kong", "india", "indonesia", "malaysia", "pakistan", "philippines",
+        "singapore", "south korea", "taiwan", "thailand", "vietnam",
     ],
     "remote": [
-        "Remote", "Remote Worldwide", "Work From Anywhere", "Distributed",
+        # Remote work flags (valid jobspy countries)
+        "worldwide", "remote",
     ],
     "worldwide": [
-        "Remote", "Remote Worldwide", "Global", "Anywhere",
+        # Global coverage
+        "worldwide", "remote",
     ],
 }
 
