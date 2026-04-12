@@ -4,7 +4,15 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sys
+
+# Fix UTF-8 encoding for Windows console
+if sys.platform == "win32":
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
@@ -12,6 +20,7 @@ from dotenv import find_dotenv, load_dotenv
 from job_hunter.collector import collect_all
 from job_hunter.filter import filter_jobs
 from job_hunter.mailer import send_jobs_email, validate_smtp_config
+from job_hunter.researcher import research_jobs
 from job_hunter.notifier_discord import send_discord_notification
 from job_hunter.notifier_telegram import send_telegram_notification, validate_telegram_config
 from job_hunter.notifier_twilio import (
@@ -61,6 +70,7 @@ BANNER = f"""
 STEP_ICONS = {
     "collect": f"{Colors.CYAN}🔍{Colors.RESET}",
     "filter": f"{Colors.MAGENTA}🧠{Colors.RESET}",
+    "research": f"{Colors.YELLOW}📚{Colors.RESET}",
     "notify": f"{Colors.GREEN}📨{Colors.RESET}",
     "profile": f"{Colors.YELLOW}👤{Colors.RESET}",
 }
@@ -68,6 +78,7 @@ STEP_ICONS = {
 STEP_TITLES = {
     "collect": "GATHERING JOB LISTINGS",
     "filter": "AI-POWERED FILTERING",
+    "research": "JOB PREPARATION RESEARCH",
     "notify": "SENDING NOTIFICATIONS",
     "profile": "PROFILE ANALYSIS",
 }
@@ -194,6 +205,8 @@ ENV_OVERRIDES = {
     "smtp_port": "SMTP_PORT",
     "smtp_user": "SMTP_USER",
     "smtp_password": "SMTP_PASSWORD",
+    "sendgrid_api_key": "SENDGRID_API_KEY",
+    "jooble_api_key": "JOOBLE_API_KEY",
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "TELEGRAM_CHAT_ID",
     "twilio_account_sid": "TWILIO_ACCOUNT_SID",
@@ -288,6 +301,18 @@ def _save_report(jobs: list[dict], provider: str = "minimax") -> Path:
     html_path.write_text(html_content, encoding="utf-8")
     txt_path.write_text(txt_content, encoding="utf-8")
 
+    # Write latest symlink for easy access to most recent report
+    try:
+        latest_html = report_dir / "latest.html"
+        latest_txt = report_dir / "latest.txt"
+        # Use relative path so it works inside and outside containers
+        latest_html.unlink(missing_ok=True)
+        latest_txt.unlink(missing_ok=True)
+        latest_html.symlink_to(html_path.name)
+        latest_txt.symlink_to(txt_path.name)
+    except OSError as exc:
+        logger.warning("Could not create latest symlink: %s", exc)
+
     logger.info("Report saved: %s and %s", html_path, txt_path)
     return html_path
 
@@ -381,10 +406,11 @@ def _parse_notify_channels(raw: str, config: dict) -> list[str]:
     if not channels:
         channels = ["email"]
 
-    # Auto-add discord as fallback if webhook URL is configured and not already specified
+    # Silent fallback: if discord webhook URL is configured, add it as a fallback
+    # even if not explicitly requested — this ensures at least one channel works
     if "discord" not in channels and config.get("discord_webhook_url"):
         channels.append("discord")
-        logger.info("Auto-added Discord as notification fallback")
+        logger.info("Discord auto-added as fallback (webhook configured)")
 
     return channels
 
@@ -536,6 +562,30 @@ def run_health_checks(config: dict) -> bool:
 
 
 def main() -> None:
+    # Graceful shutdown: save pending jobs on SIGTERM/SIGINT
+    # Using mutable containers so the nested handler can read/write without nonlocal issues
+    _handler_state = {"jobs": [], "config": {}, "shutdown_requested": False}
+
+    def _sigterm_handler(signum, frame):
+        if _handler_state["shutdown_requested"]:
+            return  # Already handling — don't double-process
+        _handler_state["shutdown_requested"] = True
+        logger.warning("Shutdown signal received — saving pending jobs before exit...")
+        jobs = _handler_state["jobs"]
+        cfg = _handler_state["config"]
+        if jobs and cfg:
+            try:
+                from job_hunter.mailer import _build_html, _build_plaintext
+                report_path = _save_report(jobs, cfg.get("provider", "minimax"))
+                _save_pending(jobs)
+                logger.info("Shutdown save complete. Report: %s", report_path)
+            except Exception:
+                logger.exception("Failed to save pending jobs on shutdown")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT, _sigterm_handler)
+
     parser = argparse.ArgumentParser(description="Job Hunter pipeline (AI Edition)")
     parser.add_argument(
         "--resume",
@@ -563,6 +613,29 @@ def main() -> None:
         action="store_true",
         help="Run health checks and exit",
     )
+    parser.add_argument(
+        "--analyze-linkedin",
+        type=str,
+        metavar="URL",
+        help="Analyze a LinkedIn profile URL and generate config.json",
+    )
+    parser.add_argument(
+        "--profile-text",
+        type=str,
+        metavar="TEXT",
+        help="Profile text to use if LinkedIn scraping fails (alternative to --analyze-linkedin)",
+    )
+    parser.add_argument(
+        "--output-config",
+        type=str,
+        default="config.json",
+        help="Output path for generated config (default: config.json)",
+    )
+    parser.add_argument(
+        "--no-research",
+        action="store_true",
+        help="Skip AI research step (saves API credits, no preparation guides generated)",
+    )
     args = parser.parse_args()
 
     # Setup colored logging
@@ -581,6 +654,54 @@ def main() -> None:
     if args.health_check:
         run_health_checks(config)
         return
+
+    # Analyze LinkedIn profile if requested
+    if args.analyze_linkedin:
+        from job_hunter.linkedin_analyzer import analyze_linkedin_profile, save_config
+
+        print(BANNER)
+        step_box("profile", f"Analyzing LinkedIn profile\n{args.analyze_linkedin}", "running")
+
+        # Validate provider
+        if args.provider == "anthropic" and not config.get("anthropic_api_key"):
+            logger.error("Missing anthropic_api_key for profile analysis")
+            sys.exit(1)
+        if args.provider == "minimax" and not config.get("minimax_api_key"):
+            logger.error("Missing minimax_api_key for profile analysis")
+            sys.exit(1)
+
+        try:
+            # Handle --profile-text option
+            profile_text = args.profile_text
+
+            # If only --profile-text is provided without URL, create a dummy URL
+            profile_url = args.analyze_linkedin
+            if not profile_url and profile_text:
+                profile_url = "https://linkedin.com/in/manual-input"
+
+            generated_config = analyze_linkedin_profile(
+                url=profile_url,
+                config=config,
+                provider=args.provider,
+                profile_text=profile_text
+            )
+
+            # Save config
+            output_path = Path(args.output_config)
+            saved_path = save_config(generated_config, output_path)
+
+            step_box(
+                "profile",
+                f"Config generated successfully!\nSaved to: {saved_path}\n"
+                f"Keywords: {len(generated_config.get('keywords', []))}\n"
+                f"Locations: {', '.join(generated_config.get('locations', []))}",
+                "done"
+            )
+            return
+
+        except Exception as e:
+            step_box("profile", f"Analysis failed: {e}", "error")
+            sys.exit(1)
 
     channels = _parse_notify_channels(args.notify, config)
 
@@ -643,6 +764,8 @@ def main() -> None:
             )
             sys.exit(1)
         jobs = _load_pending()
+        _handler_state["jobs"] = jobs
+        _handler_state["config"] = config
     else:
         if not config.get("keywords"):
             logger.error("Missing keywords — set at least one search keyword in config.json")
@@ -653,6 +776,10 @@ def main() -> None:
         step_box("collect", f"Searching {len(keywords)} keywords\nSources: LinkedIn, Indeed, Glassdoor, Gupy, RemoteOK", "running")
 
         jobs = collect_all(config)
+
+        # Keep jobs in scope for SIGTERM handler
+        _handler_state["jobs"] = jobs
+        _handler_state["config"] = config
 
         if not jobs:
             step_box("collect", "No jobs found from any source", "warn")
@@ -697,7 +824,21 @@ def main() -> None:
     filter_result = f"Approved {color_job_count(len(approved_jobs))} jobs\nPass rate: {colorize(f'{pass_rate:.1f}%', Colors.GREEN)}"
     step_box("filter", filter_result, "done")
 
-    # Step 3: Send notifications
+    # Step 3: AI Research — generate preparation guides for each approved job
+    if approved_jobs and not args.no_research:
+        research_info = f"Researching {len(approved_jobs)} jobs\nProvider: {colorize(args.provider.upper(), Colors.GREEN)}"
+        step_box("research", research_info, "running")
+
+        try:
+            approved_jobs = research_jobs(approved_jobs, config, provider=args.provider, parallel=True)
+            step_box("research", f"Preparation guides generated for {color_job_count(len(approved_jobs))} jobs", "done")
+        except Exception:
+            logger.exception("Research step failed — continuing without preparation guides")
+            step_box("research", "Research failed — jobs sent without preparation guides", "warn")
+    elif args.no_research:
+        step_box("research", "Research skipped by --no-research flag", "warn")
+
+    # Step 4: Send notifications
     ch_str = colorize(", ".join(viable_channels), Colors.YELLOW) if viable_channels else colorize("none", Colors.GRAY)
     notify_info = f"Channels: {ch_str}\nJobs to send: {color_job_count(len(approved_jobs))}"
     step_box("notify", notify_info, "running")

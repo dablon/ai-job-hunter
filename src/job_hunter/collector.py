@@ -81,6 +81,9 @@ NON_RETRYABLE_ERRORS = {
 # Errors that indicate a temporary block - skip this site for remaining keywords
 RATE_LIMIT_ERRORS = {"429", "rate limit", "too many requests", "503"}
 
+# LinkedIn circuit breaker — stop hammering after too many 429s in a row
+LINKEDIN_429_CIRCUIT_BREAK = 5  # consecutive 429s before we skip LinkedIn entirely
+
 GUPY_API_URL = "https://employability-portal.gupy.io/api/v1/jobs"
 REMOTEOK_API_URL = "https://remoteok.com/api"
 REMOTEOK_HEADERS = {
@@ -236,6 +239,9 @@ def _resolve_indeed_country(location: str) -> str:
 # Thread-safe lock for updating seen_urls
 _url_lock = Lock()
 
+# LinkedIn 429 circuit breaker — consecutive rate-limit count (module-level)
+_linkedin_429_count = 0
+
 # Max parallel workers for scraping (balance speed vs rate limiting)
 MAX_WORKERS = 4
 
@@ -249,6 +255,13 @@ def _scrape_single_job(
     seen_urls: set,
 ) -> tuple[str, str, list[dict]]:
     """Scrape a single site+keyword combination. Returns (site, term, jobs)."""
+    global _linkedin_429_count
+
+    # Circuit breaker: if LinkedIn keeps hitting 429s, skip it for the rest of the run
+    if site == "linkedin" and _linkedin_429_count >= LINKEDIN_429_CIRCUIT_BREAK:
+        logger.warning("  [linkedin] circuit breaker open — skipping '%s' for this run", term)
+        return (site, term, [])
+
     try:
         df: pd.DataFrame = _scrape_with_retries(
             site=site,
@@ -259,6 +272,9 @@ def _scrape_single_job(
         )
         with _url_lock:
             jobs = _dataframe_to_jobs(df, seen_urls)
+        # Reset 429 counter on success
+        if site == "linkedin":
+            _linkedin_429_count = 0
         logger.info("  [%s] '%s' -> %d jobs", site, term, len(jobs))
         return (site, term, jobs)
     except Exception as exc:
@@ -271,7 +287,14 @@ def _scrape_single_job(
 
         # Check for rate limit errors
         if any(err in exc_str for err in RATE_LIMIT_ERRORS):
-            logger.warning("  [%s] rate-limited", site)
+            if site == "linkedin":
+                _linkedin_429_count += 1
+                logger.warning(
+                    "  [linkedin] rate-limited (%d/%d) — %s",
+                    _linkedin_429_count, LINKEDIN_429_CIRCUIT_BREAK, exc
+                )
+            else:
+                logger.warning("  [%s] rate-limited", site)
             return (site, term, [])
 
         logger.exception("jobspy failed for site='%s' term='%s' — skipping", site, term)
@@ -280,6 +303,11 @@ def _scrape_single_job(
 
 def _collect_jobspy(config: dict) -> list[dict]:
     """Fetch from job sites via the jobspy library using parallel execution."""
+    global _linkedin_429_count
+
+    # Reset LinkedIn circuit breaker at the start of each collection run
+    _linkedin_429_count = 0
+
     keywords: list[str] = config.get("keywords", [])
     location: str = config.get("location", "")
     remote_only: bool = config.get("remote_only", False)
@@ -294,32 +322,45 @@ def _collect_jobspy(config: dict) -> list[dict]:
 
     indeed_country = _resolve_indeed_country(location)
 
-    # Build list of (site, keyword) pairs to scrape
-    tasks = []
-    for site in sites:
-        for term in keywords:
-            tasks.append((site, term))
-
     seen_urls: set[str] = set()
     combined: list[dict] = []
 
-    # Execute in parallel with limited workers
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _scrape_single_job,
-                site, term, location, remote_only, indeed_country, seen_urls
-            ): (site, term)
-            for site, term in tasks
-        }
+    # Separate LinkedIn tasks from other sites
+    linkedin_tasks = [("linkedin", term) for term in keywords]
+    other_tasks = [(site, term) for site in sites if site != "linkedin" for term in keywords]
 
-        for future in as_completed(futures):
-            site, term = futures[future]
-            try:
-                _site, _term, jobs = future.result()
-                combined.extend(jobs)
-            except Exception:
-                logger.exception("Task failed for %s/%s", site, term)
+    # Run other sites (indeed, glassdoor) in parallel — they are more rate-limit friendly
+    other_futures = {}
+    if other_tasks:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            other_futures = {
+                executor.submit(
+                    _scrape_single_job,
+                    site, term, location, remote_only, indeed_country, seen_urls
+                ): (site, term)
+                for site, term in other_tasks
+            }
+            for future in as_completed(other_futures):
+                site, term = other_futures[future]
+                try:
+                    _site, _term, jobs = future.result()
+                    combined.extend(jobs)
+                except Exception:
+                    logger.exception("Task failed for %s/%s", site, term)
+
+    # Run LinkedIn SERIALLY with a delay between each request to avoid 429s
+    for term in keywords:
+        # Check circuit breaker before each LinkedIn request
+        if _linkedin_429_count >= LINKEDIN_429_CIRCUIT_BREAK:
+            logger.warning(
+                "  [linkedin] circuit breaker open — skipping remaining keywords for this location"
+            )
+            break
+
+        jobs = _scrape_single_job("linkedin", term, location, remote_only, indeed_country, seen_urls)[2]
+        combined.extend(jobs)
+        # Delay between LinkedIn requests to respect rate limits
+        time.sleep(2)
 
     return combined
 
@@ -821,60 +862,69 @@ def _collect_jooble(config: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 REMOTIVE_API_URL = "https://remotive.com/api/remote-jobs"
+REMOTIVE_MAX_PAGES = 5  # Safety cap on pagination
 
 
 def _collect_remotive(config: dict) -> list[dict]:
-    """Fetch jobs from Remotive API.
+    """Fetch jobs from Remotive API with pagination.
 
-    Remotive has a free API for remote jobs.
+    Remotive has a free API for remote jobs — paginate to get more results.
+    Pagination: page=0 returns first batch, increment until jobs array is empty.
     """
     keywords = [k.lower() for k in config.get("keywords", [])]
-    remote_only = config.get("remote_only", True)
-
-    if not remote_only:
-        # Remotive is remote-only anyway
-        pass
 
     seen_urls: set[str] = set()
     combined: list[dict] = []
 
     try:
-        response = requests.get(REMOTIVE_API_URL, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        page = 0
+        total_fetched = 0
+        while page < REMOTIVE_MAX_PAGES:
+            params = {"page": page}
+            response = requests.get(REMOTIVE_API_URL, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
 
-        jobs = data.get("jobs", [])
+            raw_jobs = data.get("jobs", [])
+            if not raw_jobs:
+                break
 
-        for raw in jobs:
-            title_lower = raw.get("title", "").lower()
+            for raw in raw_jobs:
+                title_lower = raw.get("title", "").lower()
 
-            # Filter by keywords
-            if keywords and not any(k in title_lower for k in keywords):
-                continue
+                # Filter by keywords
+                if keywords and not any(k in title_lower for k in keywords):
+                    continue
 
-            url = raw.get("url", "")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
+                url = raw.get("url", "")
+                if not url or url in seen_urls:
+                    continue
+                seen_urls.add(url)
 
-            # Parse salary
-            salary = raw.get("salary", "")
+                salary = raw.get("salary", "")
 
-            job = {
-                "id": raw.get("id", url),
-                "title": raw.get("title", ""),
-                "company": raw.get("company_name", ""),
-                "url": url,
-                "description": raw.get("description", ""),
-                "location": raw.get("candidate_required_location", "Remote"),
-                "date_posted": raw.get("publication_date", "")[:10],
-                "source": "remotive",
-                "salary": salary,
-                "category": raw.get("category", ""),
-            }
-            combined.append(job)
+                job = {
+                    "id": raw.get("id", url),
+                    "title": raw.get("title", ""),
+                    "company": raw.get("company_name", ""),
+                    "url": url,
+                    "description": raw.get("description", ""),
+                    "location": raw.get("candidate_required_location", "Remote"),
+                    "date_posted": raw.get("publication_date", "")[:10],
+                    "source": "remotive",
+                    "salary": salary,
+                    "category": raw.get("category", ""),
+                }
+                combined.append(job)
 
-        logger.info("  [remotive] -> %d jobs", len(combined))
+            total_fetched = data.get("job-count", 0)
+            page += 1
+
+            # Stop when we've fetched all available jobs
+            if len(raw_jobs) < 50 or total_fetched == 0:
+                break
+
+        logger.info("  [remotive] -> %d jobs matched", len(combined))
 
     except Exception:
         logger.exception("remotive failed — skipping")

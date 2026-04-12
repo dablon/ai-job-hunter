@@ -12,6 +12,8 @@ services:
       - CONFIG_PATH=/app/data/config.json
       - PENDING_JOBS_PATH=/app/data/pending_jobs.json
       - SENT_URLS_PATH=/app/data/sent_urls.json
+      - REPORT_DIR=/app/data/reports
+    restart: "no"
     # Run once (for cron scheduling, trigger manually or via CI)
     # To schedule daily runs, use external cron or GitHub Actions
     profiles:

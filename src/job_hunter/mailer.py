@@ -8,10 +8,17 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
+
+from job_hunter.researcher import format_preparation_guide_html, format_preparation_guide_for_display
+
 logger = logging.getLogger(__name__)
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
+
+# SendGrid HTTP API (preferred over SMTP — uses port 443, more reliable)
+SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
 
 
 # Source color mapping
@@ -31,18 +38,43 @@ def source_color_hex(source: str) -> str:
 
 
 def validate_smtp_config(config: dict) -> bool:
-    """Validate SMTP configuration early, before the pipeline runs.
+    """Validate email configuration early, before the pipeline runs.
 
-    Checks that required fields exist and that the SMTP server is reachable.
+    Prefers SendGrid HTTP API (port 443) over SMTP (port 587) when available.
     Returns True if valid, False otherwise (logs warnings).
     """
-    for key in ("email_sender", "email_app_password", "email_recipient"):
+    for key in ("email_sender", "email_recipient"):
         if not config.get(key):
             logger.warning("Missing email config: %s — email will be skipped", key)
             return False
 
+    # Check SendGrid HTTP API first (more reliable — uses port 443)
+    sendgrid_key = (
+        config.get("sendgrid_api_key")
+        or (config.get("smtp_password", "") if "SG." in config.get("smtp_password", "") else "")
+    )
+    if sendgrid_key:
+        # Looks like a SendGrid API key — try a lightweight connectivity check
+        try:
+            resp = requests.get(
+                "https://api.sendgrid.com/v3/api_keys",
+                headers={"Authorization": f"Bearer {sendgrid_key}"},
+                timeout=10,
+            )
+            if resp.status_code in (200, 401):
+                logger.info("SendGrid API reachable — HTTP API will be used")
+                return True
+            logger.warning("SendGrid API returned %s — will fall back to SMTP", resp.status_code)
+        except Exception as exc:
+            logger.warning("SendGrid API unreachable: %s — will fall back to SMTP", exc)
+
+    # Fall back to SMTP
     smtp_host = config.get("smtp_host", "smtp.gmail.com")
     smtp_port = int(config.get("smtp_port", "587"))
+
+    if not config.get("email_app_password"):
+        logger.warning("Missing email_app_password — email will be skipped")
+        return False
 
     try:
         sock = socket.create_connection((smtp_host, smtp_port), timeout=10)
@@ -58,46 +90,114 @@ def validate_smtp_config(config: dict) -> bool:
 
 
 def send_jobs_email(jobs: list[dict], config: dict) -> None:
-    """Build an HTML email from approved jobs and send via SMTP.
+    """Build an HTML email from approved jobs and send via SendGrid HTTP API or SMTP.
 
     Raises RuntimeError if sending fails.
     """
     sender = config["email_sender"]
-    password = config["email_app_password"]
     recipient = config["email_recipient"]
-
-    smtp_host = config.get("smtp_host", "smtp.gmail.com")
-    smtp_port = int(config.get("smtp_port", "587"))
-    smtp_user = config.get("smtp_user", sender)
-    smtp_password = config.get("smtp_password", password)
 
     date_str = datetime.now().strftime("%d/%m/%Y")
     subject = f"Job Hunter — {len(jobs)} jobs found ({date_str})"
+    provider = config.get("provider", "minimax")
+    html_body = _build_html(jobs, provider)
+    text_body = _build_plaintext(jobs, provider)
+
+    # Try SendGrid HTTP API first — use dedicated key or detect from smtp_password
+    sendgrid_key = (
+        config.get("sendgrid_api_key")
+        or (config.get("smtp_password", "") if config.get("smtp_password", "").startswith("SG.") else "")
+    )
+    if sendgrid_key:
+        try:
+            _send_via_sendgrid_api(sender, recipient, subject, html_body, text_body, sendgrid_key)
+            logger.info("Email sent to %s via SendGrid HTTP API (%d jobs)", recipient, len(jobs))
+            return
+        except RuntimeError:
+            logger.warning("SendGrid HTTP API failed — falling back to SMTP")
+
+    # Fall back to SMTP
+    password = config["email_app_password"]
+    smtp_host = config.get("smtp_host", "smtp.gmail.com")
+    smtp_port = int(config.get("smtp_port", "587"))
+    smtp_user = config.get("smtp_user", sender)
+    smtp_password = config.get("smtp_password", "")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
-    provider = config.get("provider", "minimax")
-    msg.attach(MIMEText(_build_plaintext(jobs, provider), "plain", "utf-8"))
-    msg.attach(MIMEText(_build_html(jobs, provider), "html", "utf-8"))
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as server:
-                server.login(smtp_user, smtp_password)
+                server.login(smtp_user, smtp_password or password)
                 server.sendmail(sender, [recipient], msg.as_string())
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
-                server.login(smtp_user, smtp_password)
+                server.login(smtp_user, smtp_password or password)
                 server.sendmail(sender, [recipient], msg.as_string())
         logger.info("Email sent to %s (%d jobs)", recipient, len(jobs))
     except Exception as exc:
         logger.exception("Failed to send email")
         raise RuntimeError(f"Email send failed: {exc}") from exc
+
+
+def _send_via_sendgrid_api(
+    sender: str,
+    recipient: str,
+    subject: str,
+    html_body: str,
+    text_body: str,
+    api_key: str,
+) -> None:
+    """Send email via SendGrid HTTP API (port 443 — no SMTP timeout issues)."""
+    # Parse sender name and email
+    sender_name, sender_email = _parse_sender(sender)
+    recipient_name, recipient_email = _parse_sender(recipient)
+
+    payload = {
+        "personalizations": [
+            {
+                "to": [{"email": recipient_email, "name": recipient_name}] if recipient_name else [{"email": recipient_email}],
+                "subject": subject,
+            }
+        ],
+        "from": {"email": sender_email, "name": sender_name} if sender_name else {"email": sender_email},
+        "content": [
+            {"type": "text/plain", "value": text_body},
+            {"type": "text/html", "value": html_body},
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            SENDGRID_API_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code not in (200, 201, 202):
+            raise RuntimeError(f"SendGrid API returned {resp.status_code}: {resp.text[:200]}")
+    except requests.RequestException as exc:
+        raise RuntimeError(f"SendGrid HTTP API request failed: {exc}") from exc
+
+
+def _parse_sender(sender: str) -> tuple[str | None, str]:
+    """Parse 'Name <email@example.com>' into (name, email) parts."""
+    if "<" in sender and ">" in sender:
+        name = sender.split("<")[0].strip().strip('"')
+        email = sender.split("<")[1].strip(">").strip()
+        return (name or None, email)
+    return (None, sender.strip())
 
 
 def _safe_str(value) -> str:
@@ -140,6 +240,12 @@ def _build_html(jobs: list[dict], provider: str = "minimax") -> str:
                 f'<span role="img" aria-label="salary">💰</span> {salary}</p>'
             )
 
+        # Preparation guide section (if available)
+        prep_guide_html = ""
+        prep_guide = job.get("preparation_guide")
+        if prep_guide:
+            prep_guide_html = format_preparation_guide_html(prep_guide)
+
         card = f"""
         <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:16px;background:#ffffff;">
           <h3 style="margin:0 0 6px 0;font-size:16px;">
@@ -157,6 +263,7 @@ def _build_html(jobs: list[dict], provider: str = "minimax") -> str:
             &nbsp; Posted: {date_posted or 'N/A'}
           </p>
           {'' if not reason else f'<p style="margin:10px 0 0 0;padding:8px 10px;background:#f0f7ff;border-left:3px solid #0066cc;border-radius:0 4px 4px 0;font-size:13px;color:#333;"><strong>Reason:</strong> {reason}</p>'}
+          {prep_guide_html}
         </div>"""
         cards.append(card)
 
@@ -203,6 +310,15 @@ def _build_plaintext(jobs: list[dict], provider: str = "minimax") -> str:
         lines.append(f"   Link: {_safe_str(job.get('url', ''))}")
         if job.get("match_reason"):
             lines.append(f"   Reason: {_safe_str(job['match_reason'])}")
+        # Add preparation guide if available
+        prep_guide = job.get("preparation_guide")
+        if prep_guide:
+            prep_text = format_preparation_guide_for_display(prep_guide)
+            if prep_text:
+                lines.append("   --- Preparation Guide ---")
+                for pline in prep_text.split("\n"):
+                    lines.append(f"   {pline}")
+                lines.append("")
         lines.append("")
     lines.append(f"Automatically generated by Job Hunter ({provider_label} Edition).")
     return "\n".join(lines)
