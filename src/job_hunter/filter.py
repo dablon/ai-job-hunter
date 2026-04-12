@@ -10,7 +10,7 @@ import time
 
 import anthropic
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from job_hunter.utils import retry_with_backoff
 
@@ -543,60 +543,78 @@ def _filter_batch_minimax(
         "Content-Type": "application/json",
     }
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": MAX_TOKENS,
-        "temperature": 0.2,
-    }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    def _call() -> FilterResult:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=MINIMAX_TIMEOUT,
-        )
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        # Extract content from Minimax response
-        if "choices" in data and len(data["choices"]) > 0:
-            content = data["choices"][0]["message"]["content"]
-        else:
-            raise RuntimeError(f"Unexpected Minimax response: {data}")
-        
-        # Parse JSON from response (may be wrapped in markdown)
-        content = content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
-        
-        # Ensure we have valid JSON by adding braces if needed
-        if not content.startswith("{"):
-            # Find the first { and last }
-            start = content.find("{")
-            end = content.rfind("}")
-            if start >= 0 and end > start:
-                content = content[start:end+1]
-        
-        return FilterResult.model_validate_json(content)
+    max_tokens = MAX_TOKENS
+    last_exc: Exception | None = None
 
-    return retry_with_backoff(
-        _call,
-        max_retries=MAX_RETRIES,
-        base_delay=RETRY_BASE_DELAY,
-        retryable=(requests.exceptions.RequestException,),
-        context="minimax",
-    )
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            }
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=MINIMAX_TIMEOUT,
+            )
+            response.raise_for_status()
+
+            data = response.json()
+
+            # Extract content from Minimax response
+            if "choices" in data and len(data["choices"]) > 0:
+                content = data["choices"][0]["message"]["content"]
+            else:
+                raise RuntimeError(f"Unexpected Minimax response: {data}")
+
+            # Parse JSON from response (may be wrapped in markdown)
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+            # Ensure we have valid JSON by adding braces if needed
+            if not content.startswith("{"):
+                # Find the first { and last }
+                start = content.find("{")
+                end = content.rfind("}")
+                if start >= 0 and end > start:
+                    content = content[start:end+1]
+
+            return FilterResult.model_validate_json(content)
+        except ValidationError as exc:
+            # JSON parsing failed (truncated response) - retry with more tokens
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                max_tokens *= 2
+                logger.warning(
+                    f"[minimax] Response truncated at max_tokens={max_tokens//2}, "
+                    f"retrying with max_tokens={max_tokens}"
+                )
+                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
+                continue
+            raise
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            raise
+
+    # Should not reach here, but raise last exception if we did
+    raise last_exc or RuntimeError("Unexpected exit from Minimax retry loop")
 
 
 # ---------------------------------------------------------------------------
