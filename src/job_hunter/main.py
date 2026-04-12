@@ -193,6 +193,46 @@ DEFAULT_REPORT_DIR = Path("/app/data/reports")
 # Environment variable overrides — used in GitHub Actions (secrets)
 VALID_CHANNELS = {"email", "discord", "telegram", "sms", "whatsapp"}
 
+# Zone presets for geographic focus — expands to specific locations
+ZONE_PRESETS = {
+    "latin_america": [
+        "Brazil", "Argentina", "Colombia", "Mexico", "Chile", "Peru",
+        "Ecuador", "Bolivia", "Paraguay", "Uruguay", "Venezuela", "Costa Rica",
+        "Guatemala", "Panama", "Honduras", "El Salvador", "Nicaragua", "Dominican Republic",
+        "Remote Latin America",
+    ],
+    "usa": [
+        "New York", "San Francisco", "Seattle", "Austin", "Boston", "Los Angeles",
+        "Chicago", "Denver", "Atlanta", "Miami", "Washington DC", "Portland",
+        "Remote USA", "Remote",
+    ],
+    "europe": [
+        "London", "Berlin", "Paris", "Amsterdam", "Madrid", "Barcelona", "Milan",
+        "Munich", "Frankfurt", "Dublin", "Zurich", "Vienna", "Prague", "Warsaw",
+        "Remote Europe", "Remote EU",
+    ],
+    "spanish_speakers": [
+        "Spain", "Mexico", "Colombia", "Argentina", "Chile", "Peru", "Madrid",
+        "Barcelona", "Remote Spanish", "Remote Latin America",
+    ],
+    "portuguese_speakers": [
+        "Brazil", "Portugal", "Remote Brazil", "Remote Portugal",
+    ],
+    "north_america": [
+        "USA", "Canada", "Mexico", "Remote USA", "Remote Canada",
+    ],
+    "asia": [
+        "Singapore", "Japan", "Hong Kong", "South Korea", "Taiwan", "India",
+        "Philippines", "Thailand", "Vietnam", "Malaysia", "Indonesia", "Remote Asia",
+    ],
+    "remote": [
+        "Remote", "Remote Worldwide", "Work From Anywhere", "Distributed",
+    ],
+    "worldwide": [
+        "Remote", "Remote Worldwide", "Global", "Anywhere",
+    ],
+}
+
 ENV_OVERRIDES = {
     "anthropic_api_key": "ANTHROPIC_API_KEY",
     "minimax_api_key": "MINIMAX_API_KEY",
@@ -636,6 +676,20 @@ def main() -> None:
         action="store_true",
         help="Skip AI research step (saves API credits, no preparation guides generated)",
     )
+    parser.add_argument(
+        "--full-report",
+        action="store_true",
+        help="Generate a full report including ALL matching jobs (even previously sent ones). "
+             "Does not update sent_urls.json. Useful for reviewing all opportunities.",
+    )
+    parser.add_argument(
+        "--focus-zone",
+        choices=list(ZONE_PRESETS.keys()),
+        help=f"Focus job search on a specific geographic zone. "
+             f"Available zones: {', '.join(ZONE_PRESETS.keys())}. "
+             f"Example: --focus-zone latin_america will search jobs in Brazil, Argentina, "
+             f"Colombia, Mexico, Chile, and other Latin American locations.",
+    )
     args = parser.parse_args()
 
     # Setup colored logging
@@ -649,6 +703,15 @@ def main() -> None:
 
     # Load config first so we can check for auto-fallback channels
     config = load_config()
+
+    # Apply focus zone — override locations with zone preset
+    if args.focus_zone:
+        zone_locations = ZONE_PRESETS[args.focus_zone]
+        config["locations"] = zone_locations
+        # Also set primary location for backwards compatibility
+        config["location"] = zone_locations[0]
+        logger.info("Focus zone '%s' applied — %d locations: %s",
+                   args.focus_zone, len(zone_locations), ", ".join(zone_locations[:5]) + "...")
 
     # Run health checks if requested
     if args.health_check:
@@ -717,6 +780,11 @@ def main() -> None:
         config_lines.append(f"Mode:     {colorize('RESUME', Colors.MAGENTA)}")
     if args.dry_run:
         config_lines.append(f"Mode:     {colorize('DRY RUN', Colors.ORANGE)}")
+    if args.full_report:
+        config_lines.append(f"Mode:     {colorize('FULL REPORT', Colors.CYAN)}")
+    if args.focus_zone:
+        zone_locs = ZONE_PRESETS[args.focus_zone]
+        config_lines.append(f"Zone:     {colorize(args.focus_zone.upper(), Colors.CYAN)} ({len(zone_locs)} locations)")
 
     box_print("\n".join(config_lines), Colors.BLUE)
     print()
@@ -798,8 +866,11 @@ def main() -> None:
         step_box("collect", "All collected jobs were already sent in previous runs", "warn")
         return
 
-    # Filter by salary range
-    jobs = _filter_by_salary(jobs, config)
+    # Filter by salary range (skip with --full-report)
+    if args.full_report:
+        step_box("collect", "Full report mode — skipping salary filter", "warn")
+    else:
+        jobs = _filter_by_salary(jobs, config)
 
     if not jobs:
         step_box("collect", "All jobs filtered out by salary range", "warn")
@@ -846,12 +917,15 @@ def main() -> None:
     report_path = _save_report(approved_jobs, args.provider)
     succeeded = _send_notifications(viable_channels, approved_jobs, config, report_path, dry_run=args.dry_run)
 
-    # Track sent URLs for deduplication
-    for job in approved_jobs:
-        url = job.get("url", "")
-        if url:
-            sent_urls.add(url)
-    _save_sent_urls(sent_urls)
+    # Track sent URLs for deduplication (skip with --full-report)
+    if not args.full_report:
+        for job in approved_jobs:
+            url = job.get("url", "")
+            if url:
+                sent_urls.add(url)
+        _save_sent_urls(sent_urls)
+    else:
+        step_box("notify", "Full report — sent_urls.json not updated", "warn")
 
     # Final completion with fancy ASCII
     print()

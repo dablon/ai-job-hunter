@@ -318,6 +318,9 @@ docker-compose run --rm job-hunter
 # Skip AI research step (faster, no preparation guides)
 docker-compose run --rm job-hunter --no-research
 
+# Full report — include all matching jobs (deduplicates URLs, but doesn't mark as "sent")
+docker-compose run --rm job-hunter --full-report
+
 # With Anthropic instead
 docker-compose run --rm job-hunter --provider anthropic
 
