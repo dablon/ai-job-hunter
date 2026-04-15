@@ -60,7 +60,10 @@ LATAM_RE = re.compile(
 
 # Specific patterns that are clearly non-LATAM even if they contain LATAM words
 REMOTE_NON_LATAM_RE = re.compile(
-    r"remote\s*,?\s*(us|uk|london|germany|france|ireland|spain|portugal|europe)",
+    r"remote\s*,?\s*(us|united states|u\.s\.|u\.s|a\.s\.?|uk|united kingdom|england|london|britain|"
+    r"germany|france|netherlands|ireland|belgium|austria|switzerland|spain|portugal|italy|"
+    r"poland|czech|hungary|romania|bulgaria|saudi|uae|qatar|india|china|hong kong|japan|"
+    r"south korea|australia|new zealand|indonesia|malaysia|thailand|vietnam|philippines|canada|singapore)",
     re.IGNORECASE
 )
 
