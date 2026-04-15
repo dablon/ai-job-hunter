@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,8 +14,6 @@ import requests
 from pydantic import BaseModel, ValidationError
 
 from job_hunter.utils import retry_with_backoff
-
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +40,28 @@ class FilterResult(BaseModel):
 
 # Countries that are NOT in the LATAM focus zone (for pre-filtering)
 NON_LATAM_RE = re.compile(
-    r"\b(usa|united states|uk|united kingdom|london|lisbon|israel|berlin|"
-    r"paris|amsterdam|dublin|singapore|australia|canada|india|germany|"
-    r"france|netherlands|ireland|saudi|uae|japan|china|hong kong|hongkong|"
-    r"south korea|new zealand|indonesia|malaysia|thailand|vietnam|philippines)",
-    re.IGNORECASE,
+    r"\b(usa|united states|u\.s\.|u\.s|uk|united kingdom|england|london|britain|"
+    r"israel|germany|france|netherlands|ireland|belgium|austria|switzerland|"
+    r"spain|portugal|italy|poland|czech|hungary|romania|bulgaria|"
+    r"saudi|uae|qatar|india|china|hong kong|japan|south korea|australia|new zealand|"
+    r"indonesia|malaysia|thailand|vietnam|philippines|canada)\b",
+    re.IGNORECASE
+)
+
+# Only accept jobs from these LATAM country patterns
+LATAM_RE = re.compile(
+    r"\b(argentina|brazil|brasil|chile|colombia|costa rica|ecuador|mexico|panama|peru|uruguay|venezuela|"
+    r"buenos aires|santiago|bogota|bogotá|medellin|medellín|sao paulo|são paulo|rio de janeiro|"
+    r"mexico city|guadalajara|monterrey|tijuana|"
+    r"quito|lima|montevideo|panama city|ciudad de panama|caracas|"
+    r"ar\b|br\b|cl\b|co\b|cr\b|ec\b|mx\b|pa\b|pe\b|uy\b|ve\b)",
+    re.IGNORECASE
+)
+
+# Specific patterns that are clearly non-LATAM even if they contain LATAM words
+REMOTE_NON_LATAM_RE = re.compile(
+    r"remote\s*,?\s*(us|uk|london|germany|france|ireland|spain|portugal|europe)",
+    re.IGNORECASE
 )
 
 
@@ -59,75 +75,51 @@ def _prefilter_by_geo(jobs: list[dict], config: dict) -> list[dict]:
     if not focus_countries:
         return jobs  # No geo pre-filtering if no focus zone
 
-    # Build a set of valid country name/codes for fast lookup
-    valid_countries = set()
-    for c in focus_countries:
-        valid_countries.add(c.lower())
-        # Add common variations
-        if c.lower() == "argentina":
-            valid_countries.update(["ar", "argentina", "buenos aires", "cordoba"])
-        elif c.lower() == "brazil":
-            valid_countries.update(["br", "brazil", "brasil", "brasília", "são paulo", "rio de janeiro"])
-        elif c.lower() == "chile":
-            valid_countries.update(["cl", "chile", "santiago"])
-        elif c.lower() == "colombia":
-            valid_countries.update(["co", "colombia", "bogotá", "bogota", "medellín", "medellin"])
-        elif c.lower() == "costa rica":
-            valid_countries.update(["cr", "costa rica", "san josé", "san jose"])
-        elif c.lower() == "ecuador":
-            valid_countries.update(["ec", "ecuador", "quito"])
-        elif c.lower() == "mexico":
-            valid_countries.update(["mx", "mexico", "guadalajara", "monterrey", "ciudad de méxico"])
-        elif c.lower() == "panama":
-            valid_countries.update(["pa", "panama", "ciudad de panamá"])
-        elif c.lower() == "peru":
-            valid_countries.update(["pe", "peru", "lima"])
-        elif c.lower() == "uruguay":
-            valid_countries.update(["uy", "uruguay", "montevideo"])
-        elif c.lower() == "venezuela":
-            valid_countries.update(["ve", "venezuela"])
-
     approved = []
     rejected_count = 0
     for job in jobs:
         loc = str(job.get("location", "")).strip()
+        loc_lower = loc.lower()
 
-        # Empty locations and "Remote" are passed to AI for final decision
-        if not loc or loc.lower() == "remote":
+
+        # "Remote" alone or empty - let AI decide
+        if not loc or loc_lower == "remote":
             approved.append(job)
             continue
 
-        # Check for obviously non-LATAM country names/codes
-        loc_lower = loc.lower()
+        # CHECK ORDER: LATAM first (allow), then non-LATAM (reject)
+
+        # 1. Does it match a LATAM pattern? → ALLOW
+        if LATAM_RE.search(loc_lower):
+            approved.append(job)
+            continue
+
+        # 2. Does it match a non-LATAM country name? → REJECT
         if NON_LATAM_RE.search(loc_lower):
             logger.debug(f"Pre-filter rejected (non-LATAM): {job.get('title','')} @ {loc}")
             rejected_count += 1
             continue
 
-        # Extract potential country code (last 2-3 characters after comma or standalone)
-        words = loc.replace(",", " ").split()
-        valid = False
-        for word in words:
-            word_clean = word.lower().strip()
-            # Check 2-letter country codes
-            if len(word_clean) == 2 and word_clean in valid_countries:
-                valid = True
-                break
-            # Check country names
-            if word_clean in valid_countries:
-                valid = True
-                break
-        # Also check full location string against valid country names
-        if not valid:
-            for vc in valid_countries:
-                if vc in loc_lower and len(vc) > 2:  # Only match full country names, not 2-letter codes
-                    valid = True
-                    break
+        # 3. Does it match "Remote, US/UK/etc." (non-LATAM remote)? → REJECT
+        if REMOTE_NON_LATAM_RE.search(loc_lower):
+            logger.debug(f"Pre-filter rejected (remote non-LATAM): {job.get('title','')} @ {loc}")
+            rejected_count += 1
+            continue
 
-        if valid:
+        # 3. Check for valid 2-letter LATAM country codes in location string
+        valid_codes = {"ar", "br", "cl", "co", "cr", "ec", "mx", "pa", "pe", "uy", "ve"}
+        words = loc.replace(",", " ").split()
+        code_found = False
+        for word in words:
+            wc = word.lower().strip()
+            if len(wc) == 2 and wc in valid_codes:
+                code_found = True
+                break
+
+        if code_found:
             approved.append(job)
         else:
-            # Location not recognized as LATAM - let AI decide
+            # Unknown location - let AI decide
             approved.append(job)
 
     if rejected_count > 0:
@@ -155,159 +147,211 @@ def analyze_and_refine_profile(config: dict, provider: str = "minimax") -> dict:
     location = config.get("location", "")
     remote_only = config.get("remote_only", True)
     
-    if not profile:
-        logger.warning("No profile found, skipping AI analysis")
-        return config
-    
     if provider == "minimax":
-        return _analyze_profile_minimax(config)
+        return _analyze_profile_minimax(profile, keywords, location, remote_only, config)
+    elif provider == "opencode":
+        return _analyze_profile_opencode(profile, keywords, location, remote_only, config)
     else:
-        return _analyze_profile_anthropic(config)
+        return _analyze_profile_anthropic(profile, keywords, location, remote_only, config)
 
 
-def _analyze_profile_minimax(config: dict) -> dict:
-    """Use Minimax to analyze and refine the profile."""
-    import requests
+def _build_filter_prompt(jobs: list[dict], config: dict, strictness: str = "balanced") -> str:
+    """Build the filtering prompt for the AI provider.
     
-    api_key = config.get("minimax_api_key", "")
-    model = config.get("minimax_model", "MiniMax-M2.5")
-    
-    if not api_key:
-        logger.warning("No minimax_api_key, skipping profile analysis")
-        return config
-    
+    Returns tuple of (system_prompt, user_prompt)
+    """
     profile = config.get("profile", "")
-    keywords = config.get("keywords", [])
+    constraints = _build_hard_constraints(config)
+    strictness_instruction = _get_strictness_instruction(strictness)
+    full_constraints = f"{constraints}\n{strictness_instruction}" if constraints else strictness_instruction
     
-    prompt = f"""Analyze this job seeker profile and provide refined search parameters.
+    # Build the job list for the prompt
+    job_listings = []
+    for i, job in enumerate(jobs):
+        title = job.get("title", "N/A")
+        company = job.get("company", "N/A")
+        location = job.get("location", "N/A")
+        salary = job.get("salary", "N/A")
+        url = job.get("url", "N/A")
+        description = job.get("description", "")[:MAX_DESCRIPTION_CHARS]
+        tags = ", ".join(job.get("tags", []))
+        
+        job_listings.append(
+            f"[JOB {i}] {title}\n"
+            f"  Company: {company}\n"
+            f"  Location: {location}\n"
+            f"  Salary: {salary}\n"
+            f"  Tags: {tags}\n"
+            f"  URL: {url}\n"
+            f"  Description: {description}"
+        )
+    
+    jobs_text = "\n\n".join(job_listings)
+    
+    system_prompt = f"""You are an expert job search advisor helping a highly skilled infrastructure engineer find their next role.
 
-## Current Profile:
+## USER PROFILE
 {profile}
 
-## Current Keywords:
-{", ".join(keywords)}
+## HARD CONSTRAINTS (MUST REJECT if violated)
+{full_constraints}
 
-## Current Preferences:
-- Location: {config.get("location", "Any")}
-- Remote only: {config.get("remote_only", True)}
+## YOUR TASK
+Review each job against the profile and constraints. Be honest — reject jobs that don't fit, even if they're interesting. The user wants quality matches, not quantity.
 
-Respond with ONLY a JSON object containing:
+## OUTPUT FORMAT
+You must respond with a JSON object with this exact structure:
 {{
-  "refined_profile": "2-3 sentence summary of the candidate's ideal job targets",
-  "suggested_keywords": ["keyword1", "keyword2", ...],
-  "search_tips": "2-3 specific tips for finding matching jobs"
+  "approved": [
+    {{
+      "job_index": <number>,
+      "reason": "<one sentence explanation of why this is a good fit>",
+      "score": <0-100>
+    }}
+  ]
 }}
 
-Focus on: tech stack, seniority level, industry fit, and role types."""
-
-    url = "https://api.minimax.io/v1/text/chatcompletion_v2"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a career advisor and job search expert. Analyze profiles and suggest optimized job search strategies."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 800,
-        "temperature": 0.3,
-    }
+Respond with ONLY the JSON object, no markdown, no explanation outside the JSON.
+"""
     
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        logger.info(f"AI Profile Analysis response: {content[:200]}...")
-        
-        content = content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        elif content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        content = content.strip()
+    user_prompt = f"""Review these {len(jobs)} jobs:
 
-        # Try to find valid JSON in the response
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
-            # Try to extract JSON object from potentially corrupted response
-            start = content.find("{")
-            end = content.rfind("}")
-            if start >= 0 and end > start:
-                content = content[start:end+1]
-                try:
-                    result = json.loads(content)
-                except json.JSONDecodeError:
-                    raise ValueError(f"Could not parse JSON from response: {content[:200]}...")
-            else:
-                raise ValueError(f"No JSON object found in response: {content[:200]}...")
-        
-        refined_config = config.copy()
-        refined_config["profile"] = result.get("refined_profile", profile)
-        refined_config["keywords"] = result.get("suggested_keywords", keywords)
-        refined_config["search_tips"] = result.get("search_tips", "")
-        
-        logger.info(f"Profile refined. New keywords: {refined_config['keywords']}")
-        return refined_config
-        
-    except Exception as e:
-        logger.warning(f"Profile analysis failed: {e}, using original config")
-        return config
+{jobs_text}
 
-
-def _analyze_profile_anthropic(config: dict) -> dict:
-    """Use Anthropic to analyze and refine the profile."""
-    api_key = config.get("anthropic_api_key", "")
+Respond with JSON only."""
     
-    if not api_key:
-        logger.warning("No anthropic_api_key, skipping profile analysis")
-        return config
+    return system_prompt, user_prompt
+
+
+def _build_hard_constraints(config: dict) -> str:
+    """Build hard constraints string for filtering prompt."""
+    lines = []
     
-    prompt = f"""Analyze this job seeker profile and provide refined search parameters.
+    # Job titles to exclude
+    exclude_titles = config.get("exclude_titles", [])
+    if exclude_titles:
+        lines.append("- EXCLUDED TITLES: Do not recommend any job with these words in the title: " + ", ".join([f'"{t}"' for t in exclude_titles]))
 
-## Current Profile:
-{config.get("profile", "")}
+    # Experience level
+    experience = config.get("experience_level", "senior")
+    if experience == "senior":
+        lines.append("- Only accept senior-level (5+ years) or lead positions. REJECT entry-level, junior, internship, or mid-level (0-3 years) roles.")
+    elif experience == "mid-senior":
+        lines.append("- Only accept mid-senior or senior positions (3+ years). REJECT entry-level and junior roles.")
 
-## Current Keywords:
-{", ".join(config.get("keywords", []))}
+    # Location constraints
+    location = config.get("location", "")
+    locations = config.get("locations", [])
+    if location:
+        lines.append(f"- JOB LOCATION: Must be in or remote to {location}.")
+    elif locations:
+        lines.append(f"- JOB LOCATIONS: Must be in or remote to one of: {', '.join(locations)}.")
 
-Respond with ONLY a JSON object containing:
-{{
-  "refined_profile": "2-3 sentence summary",
-  "suggested_keywords": ["keyword1", "keyword2", ...]
-}}"""
+    # Remote only
+    remote_only = config.get("remote_only", True)
+    if remote_only:
+        if location:
+            lines.append(
+                f"Reject on-site jobs outside {location}."
+            )
 
-    client = anthropic.Anthropic(api_key=api_key)
-    
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
+    # Focus zone locations (LATAM, EUROPE, etc.) - validate job is from one of these countries
+    focus_countries = config.get("focus_countries", [])
+    if focus_countries:
+        countries_str = ", ".join([f'"{c}"' for c in focus_countries])
+        lines.append(
+            f"- GEOGRAPHIC FILTER: This search is limited to these countries/regions: {countries_str}. "
+            f"REJECT any job where the job location or company headquarters is outside these areas. "
+            f"Jobs must be physically based in one of these countries, not just 'remote to' them."
         )
-        content = message.content[0].text
-        result = json.loads(content)
+
+    # Company exclusion list
+    exclude_companies = config.get("exclude_companies", [])
+    if exclude_companies:
+        lines.append("- EXCLUDED COMPANIES: Do not recommend jobs from these companies: " + ", ".join([f'"{c}"' for c in exclude_companies]))
+
+    # Keywords filter
+    keywords = config.get("keywords", [])
+    if keywords:
+        lines.append(f"- Target roles should match some of these keywords: {', '.join(keywords)}")
+
+    # Salary constraints
+    salary_min = config.get("salary_min", 0)
+    salary_max = config.get("salary_max", 0)
+    if salary_min > 0 or salary_max > 0:
+        salary_line = "- SALARY: "
+        if salary_min > 0 and salary_max > 0:
+            salary_line += f"Must pay between ${salary_min:,}-${salary_max:,}/year"
+        elif salary_min > 0:
+            salary_line += f"Must pay at least ${salary_min:,}/year"
+        elif salary_max > 0:
+            salary_line += f"Must pay no more than ${salary_max:,}/year"
+        lines.append(salary_line)
+
+    return "\n".join(lines)
+
+
+def _get_strictness_instruction(strictness: str) -> str:
+    """Get additional instructions based on strictness level."""
+    if strictness == "loose":
+        return ("- STRICTNESS: Be lenient. Accept any job that could possibly be a fit, even with minor "
+                "mismatches. Focus on catching clearly bad fits. Better to include a marginal job than miss a good one.")
+    elif strictness == "strict":
+        return ("- STRICTNESS: Be very selective. Only accept jobs with strong matches across most criteria. "
+                "Reject anything with significant gaps. The user values quality over quantity.")
+    else:  # balanced
+        return ("- STRICTNESS: Be balanced. Accept jobs with reasonable fit, where most criteria align. "
+                "Reject only when there are meaningful mismatches.")
+
+
+def _parse_filter_response(response: str) -> list[ApprovedJob]:
+    """Parse AI response into ApprovedJob objects."""
+    try:
+        # Try to find JSON in the response
+        json_match = None
+        for line in response.split('\n'):
+            line = line.strip()
+            if line.startswith('{') and not json_match:
+                # Find the end of the JSON object
+                depth = 0
+                start = line.find('{')
+                end = start
+                for i, c in enumerate(line):
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if depth == 0:
+                    json_str = line[start:end]
+                    json_match = json_str
+                    break
         
-        refined_config = config.copy()
-        refined_config["profile"] = result.get("refined_profile", config.get("profile", ""))
-        refined_config["keywords"] = result.get("suggested_keywords", config.get("keywords", []))
+        if not json_match:
+            # Try to extract from anywhere in the response
+            import re
+            json_match = re.search(r'\{.*"approved".*\}', response, re.DOTALL)
+            if json_match:
+                json_match = json_match.group(0)
         
-        return refined_config
+        if json_match:
+            data = json.loads(json_match)
+            approved = [ApprovedJob(**item) for item in data.get("approved", [])]
+            return approved
         
+        logger.warning("Could not parse JSON from filter response")
+        logger.debug(f"Response was: {response[:500]}")
+        return []
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON decode error: {e}")
+        logger.debug(f"Response was: {response[:500]}")
+        return []
     except Exception as e:
-        logger.warning(f"Profile analysis failed: {e}, using original config")
-        return config
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+        logger.warning(f"Error parsing filter response: {e}")
+        logger.debug(f"Response was: {response[:500]}")
+        return []
 
 
 def filter_jobs(
@@ -341,519 +385,204 @@ def filter_jobs(
     full_constraints = f"{constraints}\n{strictness_instruction}" if constraints else strictness_instruction
 
     if provider == "opencode":
-        batch_fn = _make_opencode_batch_fn(config, profile, full_constraints)
-        return _filter_in_batches(jobs, batch_fn, provider)
+        return _filter_jobs_opencode(jobs, config, full_constraints, strictness)
     elif provider == "minimax":
-        batch_fn = _make_minimax_batch_fn(config, profile, full_constraints)
-        return _filter_in_batches(jobs, batch_fn, provider)
+        return _filter_jobs_minimax(jobs, config, full_constraints, strictness)
     else:
-        batch_fn = _make_anthropic_batch_fn(config, profile, full_constraints)
-        return _filter_in_batches(
-            jobs, batch_fn, provider, abort_on=(anthropic.BadRequestError,)
-        )
+        return _filter_jobs_anthropic(jobs, config, full_constraints, strictness)
 
 
-def _get_strictness_instruction(strictness: str) -> str:
-    """Get the AI instruction based on strictness level."""
-    instructions = {
-        "loose": (
-            "FILTER STRICTNESS (LOOSE): Approve any job that has ANY potential fit. "
-            "Even partial matches are worth showing. Don't filter out jobs - let the user decide."
-        ),
-        "balanced": (
-            "FILTER STRICTNESS (BALANCED): Reject only jobs with clear mismatches. "
-            "Consider: skills gap, seniority mismatch, wrong location. "
-            "If there's any reasonable chance, approve it."
-        ),
-        "strict": (
-            "FILTER STRICTNESS (STRICT): Only approve jobs with strong matches. "
-            "Reject if: different tech stack, wrong seniority level, missing key skills. "
-            "Focus on high-quality matches only."
-        ),
-    }
-    return instructions.get(strictness, instructions["balanced"])
-# ---------------------------------------------------------------------------
-# Shared batch loop
-# ---------------------------------------------------------------------------
+def _filter_jobs_anthropic(jobs: list[dict], config: dict, constraints: str, strictness: str) -> list[dict]:
+    """Filter jobs using Anthropic Claude."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
 
-
-def _filter_in_batches(
-    jobs: list[dict],
-    batch_fn,
-    provider: str,
-    abort_on: tuple[type[Exception], ...] = (),
-) -> list[dict]:
-    """Run *batch_fn* over job batches, collecting approved results.
-
-    *abort_on* exceptions propagate immediately (permanent errors).
-    All other exceptions are logged and the batch is skipped.
-    """
-    approved_jobs: list[dict] = []
-    batches_succeeded = 0
+    client = anthropic.Anthropic(api_key=api_key)
+    approved_jobs = []
     total_batches = (len(jobs) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for i in range(0, len(jobs), BATCH_SIZE):
-        batch = jobs[i : i + BATCH_SIZE]
-        batch_num = i // BATCH_SIZE + 1
-        logger.info(
-            "[%s] Batch %d/%d (%d jobs)", provider, batch_num, total_batches, len(batch)
-        )
+    for batch_num in range(total_batches):
+        batch_start = batch_num * BATCH_SIZE
+        batch_end = min(batch_start + BATCH_SIZE, len(jobs))
+        batch = jobs[batch_start:batch_end]
 
-        if i > 0:
-            time.sleep(BATCH_DELAY_SECONDS)
+        logger.info(f"[anthropic] Batch {batch_num + 1}/{total_batches} ({len(batch)} jobs)")
 
         try:
-            result = batch_fn(batch)
-            batches_succeeded += 1
-            approved_jobs.extend(_extract_approved(result, batch))
-        except abort_on as exc:
-            logger.error("Permanent API error — aborting: %s", exc)
-            raise RuntimeError(f"AI filtering aborted: {exc}") from exc
-        except Exception:
-            logger.exception("[%s] Batch %d failed — skipping", provider, batch_num)
+            result = _filter_batch_anthropic(client, batch, config, constraints, strictness)
+            approved_jobs.extend(result)
+            
+            if batch_num < total_batches - 1:
+                time.sleep(BATCH_DELAY_SECONDS)
+        except Exception as e:
+            logger.error(f"Batch {batch_num + 1} failed: {e}")
+            if batch_num == total_batches - 1:
+                raise
 
-    if batches_succeeded == 0:
-        raise RuntimeError(f"All {provider} batches failed")
-
-    logger.info(
-        "AI filter (%s): %d in -> %d approved", provider, len(jobs), len(approved_jobs)
-    )
     return approved_jobs
 
 
-# ---------------------------------------------------------------------------
-# Hard constraints
-# ---------------------------------------------------------------------------
-
-
-def _build_hard_constraints(config: dict) -> str:
-    """Build an explicit constraints block from config settings.
-
-    These are injected into every prompt as non-negotiable rejection rules.
-    """
-    lines: list[str] = []
-
-    if config.get("remote_only"):
-        lines.append(
-            "- REMOTE WORK: If the job says 'remote' or 'work from anywhere' or has no location, "
-            "ASSUME it's remote. Only reject if it explicitly says 'on-site', 'hybrid', "
-            "'in-office', or 'must work from [city]'. "
-            "If location is empty or says 'remote worldwide' — APPROVE."
-        )
-
-    location = config.get("location", "").strip()
-    if location and not config.get("remote_only"):
-        lines.append(
-            f"- LOCATION: the user is in {location}. "
-            f"Reject on-site jobs outside {location}."
-        )
-
-    # Focus zone locations (LATAM, EUROPE, etc.) - validate job is from one of these countries
-    focus_countries = config.get("focus_countries", [])
-    if focus_countries:
-        countries_str = ", ".join([f'"{c}"' for c in focus_countries])
-        lines.append(
-            f"- GEOGRAPHIC FILTER: This search is limited to these countries/regions: {countries_str}. "
-            f"REJECT any job where the job location or company headquarters is outside these areas. "
-            f"Jobs must be physically based in one of these countries, not just 'remote to' them."
-        )
-
-    # Company exclusion list
-    exclude_companies = config.get("exclude_companies", [])
-    if exclude_companies:
-        companies_str = ", ".join([f'"{c}"' for c in exclude_companies])
-        lines.append(
-            f"- EXCLUDED COMPANIES: REJECT jobs from these companies: {companies_str}"
-        )
-
-    # Keyword exclusion list
-    exclude_keywords = config.get("exclude_keywords", [])
-    if exclude_keywords:
-        keywords_str = ", ".join([f'"{k}"' for k in exclude_keywords])
-        lines.append(
-            f"- EXCLUDED KEYWORDS: REJECT jobs containing these keywords: {keywords_str}"
-        )
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Prompt building
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = (
-    "You are a helpful job-matching assistant. Respond ONLY with a JSON object — "
-    "no markdown, no explanation, no text before or after the JSON.\n\n"
-    "APPROVE a job if there's ANY reasonable chance the user could land it. "
-    "Be VERY generous — if there's a fit, include it. Don't be overly picky.\n\n"
-    "REJECT only if:\n"
-    "- The job explicitly requires on-site or hybrid work (not remote)\n"
-    "- The job requires a location the user cannot work from AND is not remote\n"
-    "- The job requires a language the user doesn't speak\n"
-    "- Company is in your exclusion list\n"
-    "- Job contains excluded keywords\n\n"
-    "DO NOT REJECT for:\n"
-    "- Seniority mismatch (a Principal can do Staff/Senior roles)\n"
-    "- Different but related tech stack (if they know .NET, accept Java/Python jobs too)\n"
-    "- Missing years of experience — if they have 20 years, they can do anything\n"
-    "- Vague or missing location — assume remote if not stated\n"
-    "- Promoted/sponsored listings — still worth showing\n\n"
-    "For each approved job, provide:\n"
-    "- job_index: The index of the job\n"
-    "- reason: Explain WHY the job could be a good match\n"
-    "- score: Rate match quality 0-100 (100 = perfect match)\n\n"
-    'Required format: {"approved": [{"job_index": 0, "reason": "reason in English", "score": 85}]}\n'
-    'If nothing matches: {"approved": []}'
-)
-
-
-def _build_job_filter_prompt(
-    profile: str,
-    constraints: str,
-    jobs_text: str,
-    include_system_in_user: bool = True,
-) -> tuple[str, str]:
-    """Build system and user prompts for job filtering.
-
-    Args:
-        profile: User's profile text
-        constraints: Hard constraints string
-        jobs_text: Formatted job listings
-        include_system_in_user: If True, include system prompt in user message (for Minimax)
-
-    Returns:
-        Tuple of (system_prompt, user_prompt)
-    """
-    hard_constraints_section = (
-        f"\n\nHARD CONSTRAINTS (non-negotiable — REJECT if violated):\n{constraints}"
-        if constraints
-        else ""
-    )
-
-    user_prompt = (
-        "IMPORTANT: Your response must be ONLY a valid JSON object. "
-        "No markdown, no explanation, no text before or after the JSON.\n\n"
-        "Task: Evaluate the job postings below against the user's profile. "
-        "APPROVE any job that could possibly be a fit. Be VERY generous.\n\n"
-        "Only REJECT if:\n"
-        "- Job explicitly requires on-site or hybrid (not remote)\n"
-        "- Job is in wrong language or requires relocation you can't do\n\n"
-        "DO NOT reject for: seniority mismatch, different tech stack, missing years of experience, "
-        "vague location, or promoted listings.\n\n"
-        "Required JSON format:\n"
-        '{"approved": [{"job_index": 0, "reason": "reason in English"}, ...]}\n'
-        'If nothing matches: {"approved": []}\n\n'
-        f"## User Profile\n{profile}"
-        f"{hard_constraints_section}\n\n"
-        f"## Jobs to Evaluate\n{jobs_text}\n\n"
-        "Respond with ONLY the JSON object."
-    )
-
-    if include_system_in_user:
-        # For Minimax/opencode: embed system in user prompt
-        return ("", user_prompt)
-
-    # For Anthropic: separate system and user prompts
-    return (SYSTEM_PROMPT, user_prompt)
-
-
-def _build_user_prompt(profile: str, constraints: str, jobs_text: str) -> str:
-    hard_constraints_section = (
-        f"\n\nHARD CONSTRAINTS (non-negotiable — REJECT if violated):\n{constraints}"
-        if constraints
-        else ""
-    )
-    return (
-        f"## User Profile\n{profile}"
-        f"{hard_constraints_section}"
-        f"\n\n## Jobs to Evaluate\n{jobs_text}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Anthropic provider
-# ---------------------------------------------------------------------------
-
-
-def _make_anthropic_batch_fn(config: dict, profile: str, constraints: str):
-    api_key = config.get("anthropic_api_key", "")
-    if not api_key:
-        raise RuntimeError("anthropic_api_key not set in config")
-    client = anthropic.Anthropic(api_key=api_key)
-
-    def batch_fn(batch: list[dict]) -> FilterResult:
-        jobs_text = _format_jobs_for_prompt(batch)
-        user_prompt = _build_user_prompt(profile, constraints, jobs_text)
-
-        def _call() -> FilterResult:
-            response = client.messages.create(
-                model=ANTHROPIC_MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {"role": "user", "content": user_prompt},
-                    {"role": "assistant", "content": "{"},
-                ],
-            )
-            raw_text = "{" + response.content[0].text
-            return FilterResult.model_validate_json(raw_text)
-
-        return retry_with_backoff(
-            _call,
-            max_retries=MAX_RETRIES,
-            base_delay=RETRY_BASE_DELAY,
-            retryable=(
-                anthropic.RateLimitError,
-                anthropic.InternalServerError,
-                anthropic.APIConnectionError,
-            ),
-            context="anthropic",
-        )
-
-    return batch_fn
-
-
-# ---------------------------------------------------------------------------
-# Minimax provider (NEW)
-# ---------------------------------------------------------------------------
-
-
-def _make_minimax_batch_fn(config: dict, profile: str, constraints: str):
-    api_key = config.get("minimax_api_key", "")
-    if not api_key:
-        raise RuntimeError("minimax_api_key not set in config")
-    if len(api_key) < 20:
-        raise RuntimeError(f"minimax_api_key seems invalid (too short): {api_key[:10]}...")
+def _filter_batch_anthropic(client, batch: list[dict], config: dict, constraints: str, strictness: str) -> list[dict]:
+    """Filter a single batch using Anthropic."""
+    profile = config.get("profile", "")
     
-    model = config.get("minimax_model", "MiniMax-M2.5")
+    system_prompt, user_prompt = _build_filter_prompt(batch, config, strictness)
     
-    def batch_fn(batch: list[dict]) -> FilterResult:
-        return _filter_batch_minimax(batch, profile, constraints, api_key, model)
-
-    return batch_fn
-
-
-def _filter_batch_minimax(
-    batch: list[dict],
-    profile: str,
-    constraints: str,
-    api_key: str,
-    model: str = "MiniMax-M2.5",
-) -> FilterResult:
-    """Call Minimax API and parse the JSON response."""
-    jobs_text = _format_jobs_for_prompt(batch)
-    system_prompt, user_prompt = _build_job_filter_prompt(
-        profile, constraints, jobs_text, include_system_in_user=True
+    response = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}]
     )
+    
+    approved = _parse_filter_response(response.content[0].text)
+    
+    # Build result with full job data
+    result = []
+    for item in approved:
+        if 0 <= item.job_index < len(batch):
+            job = batch[item.job_index].copy()
+            job["reason"] = item.reason
+            job["match_score"] = item.score
+            result.append(job)
+    
+    return result
 
-    # Minimax API endpoint
-    url = "https://api.minimax.io/v1/text/chatcompletion_v2"
 
+def _filter_jobs_minimax(jobs: list[dict], config: dict, constraints: str, strictness: str) -> list[dict]:
+    """Filter jobs using Minimax API."""
+    api_key = os.environ.get("MINIMAX_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("MINIMAX_API_KEY not set")
+
+    group_id = os.environ.get("MINIMAX_GROUP_ID", "")
+    if not group_id:
+        raise RuntimeError("MINIMAX_GROUP_ID not set")
+
+    approved_jobs = []
+    total_batches = (len(jobs) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_num in range(total_batches):
+        batch_start = batch_num * BATCH_SIZE
+        batch_end = min(batch_start + BATCH_SIZE, len(jobs))
+        batch = jobs[batch_start:batch_end]
+
+        logger.info(f"[minimax] Batch {batch_num + 1}/{total_batches} ({len(batch)} jobs)")
+
+        try:
+            result = _filter_batch_minimax(api_key, group_id, batch, config, strictness)
+            approved_jobs.extend(result)
+            
+            if batch_num < total_batches - 1:
+                time.sleep(BATCH_DELAY_SECONDS)
+        except Exception as e:
+            logger.error(f"Batch {batch_num + 1} failed: {e}")
+            if batch_num == total_batches - 1:
+                raise
+
+    return approved_jobs
+
+
+def _filter_batch_minimax(api_key: str, group_id: str, batch: list[dict], config: dict, strictness: str) -> list[dict]:
+    """Filter a single batch using Minimax API."""
+    system_prompt, user_prompt = _build_filter_prompt(batch, config, strictness)
+    
+    url = f"https://api.minimax.chat/v1/text/chatcompletion_pro?GroupId={group_id}"
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
+    
+    payload = {
+        "model": "abab6.5s-chat",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": MAX_TOKENS
+    }
+    
+    response = requests.post(url, headers=headers, json=payload, timeout=MINIMAX_TIMEOUT)
+    
+    if response.status_code != 200:
+        raise RuntimeError(f"Minimax API error: {response.status_code} {response.text}")
+    
+    data = response.json()
+    response_text = data["choices"][0]["message"]["content"]
+    
+    approved = _parse_filter_response(response_text)
+    
+    result = []
+    for item in approved:
+        if 0 <= item.job_index < len(batch):
+            job = batch[item.job_index].copy()
+            job["reason"] = item.reason
+            job["match_score"] = item.score
+            result.append(job)
+    
+    return result
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
 
-    max_tokens = MAX_TOKENS
-    last_exc: Exception | None = None
+def _filter_jobs_opencode(jobs: list[dict], config: dict, constraints: str, strictness: str) -> list[dict]:
+    """Filter jobs using opencode CLI."""
+    approved_jobs = []
+    total_batches = (len(jobs) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    for attempt in range(MAX_RETRIES + 1):
+    for batch_num in range(total_batches):
+        batch_start = batch_num * BATCH_SIZE
+        batch_end = min(batch_start + BATCH_SIZE, len(jobs))
+        batch = jobs[batch_start:batch_end]
+
+        logger.info(f"[opencode] Batch {batch_num + 1}/{total_batches} ({len(batch)} jobs)")
+
         try:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            }
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=MINIMAX_TIMEOUT,
-            )
-            response.raise_for_status()
+            result = _filter_batch_opencode(batch, config, strictness)
+            approved_jobs.extend(result)
+            
+            if batch_num < total_batches - 1:
+                time.sleep(BATCH_DELAY_SECONDS)
+        except Exception as e:
+            logger.error(f"Batch {batch_num + 1} failed: {e}")
+            if batch_num == total_batches - 1:
+                raise
 
-            data = response.json()
-
-            # Extract content from Minimax response
-            if "choices" in data and len(data["choices"]) > 0:
-                content = data["choices"][0]["message"]["content"]
-            else:
-                raise RuntimeError(f"Unexpected Minimax response: {data}")
-
-            # Parse JSON from response (may be wrapped in markdown)
-            content = content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-
-            # Ensure we have valid JSON by adding braces if needed
-            if not content.startswith("{"):
-                # Find the first { and last }
-                start = content.find("{")
-                end = content.rfind("}")
-                if start >= 0 and end > start:
-                    content = content[start:end+1]
-
-            return FilterResult.model_validate_json(content)
-        except ValidationError as exc:
-            # JSON parsing failed (truncated response) - retry with more tokens
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                max_tokens *= 2
-                logger.warning(
-                    f"[minimax] Response truncated at max_tokens={max_tokens//2}, "
-                    f"retrying with max_tokens={max_tokens}"
-                )
-                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
-                continue
-            raise
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                continue
-            raise
-
-    # Should not reach here, but raise last exception if we did
-    raise last_exc or RuntimeError("Unexpected exit from Minimax retry loop")
+    return approved_jobs
 
 
-# ---------------------------------------------------------------------------
-# opencode provider
-# ---------------------------------------------------------------------------
-
-
-def _make_opencode_batch_fn(config: dict, profile: str, constraints: str):
-    model = config.get("opencode_model", "")
-    opencode_exe = shutil.which("opencode")
-    if not opencode_exe:
-        raise RuntimeError(
-            "opencode executable not found in PATH. "
-            "Install it with: npm install -g opencode-ai"
-        )
-
-    def batch_fn(batch: list[dict]) -> FilterResult:
-        return _filter_batch_opencode(
-            batch, profile, constraints, model, opencode_exe
-        )
-
-    return batch_fn
-
-
-def _filter_batch_opencode(
-    batch: list[dict],
-    profile: str,
-    constraints: str,
-    model: str,
-    opencode_exe: str,
-) -> FilterResult:
-    """Call opencode CLI via a temp file and parse the JSON response."""
-    jobs_text = _format_jobs_for_prompt(batch)
-    _, prompt_content = _build_job_filter_prompt(
-        profile, constraints, jobs_text, include_system_in_user=True
-    )
-
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="jobhunter_")
+def _filter_batch_opencode(batch: list[dict], config: dict, strictness: str) -> list[dict]:
+    """Filter a single batch using opencode CLI."""
+    system_prompt, user_prompt = _build_filter_prompt(batch, config, strictness)
+    
+    model = os.environ.get("OPENCODE_MODEL", "anthropic/claude-haiku-4-5")
+    timeout = OPENCODE_TIMEOUT
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(f"SYSTEM: {system_prompt}\n\nUSER: {user_prompt}")
+        temp_file = f.name
+    
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(prompt_content)
-
-        cmd = [
-            opencode_exe,
-            "run",
-            "Read the attached file carefully and respond with the JSON object exactly as instructed inside it.",
-            "--file",
-            tmp_path,
-        ]
-        if model:
-            cmd += ["--model", model]
-
-        proc = subprocess.run(
-            cmd,
+        result = subprocess.run(
+            ["opencode", "-m", model, "--no-stream", temp_file],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            timeout=OPENCODE_TIMEOUT,
+            timeout=timeout
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"opencode timed out after {OPENCODE_TIMEOUT}s")
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Opencode error: {result.stderr}")
+        
+        approved = _parse_filter_response(result.stdout)
+        
+        result_jobs = []
+        for item in approved:
+            if 0 <= item.job_index < len(batch):
+                job = batch[item.job_index].copy()
+                job["reason"] = item.reason
+                job["match_score"] = item.score
+                result_jobs.append(job)
+        
+        return result_jobs
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-    if proc.returncode != 0:
-        logger.warning("opencode stderr: %s", proc.stderr[:1000] or "(empty)")
-        logger.warning("opencode stdout: %s", proc.stdout[:500] or "(empty)")
-        raise RuntimeError(f"opencode exited with code {proc.returncode}")
-
-    if not proc.stdout.strip():
-        raise RuntimeError("opencode returned empty response")
-
-    # Parse JSON from opencode output (may be wrapped in markdown)
-    output = proc.stdout.strip()
-    if output.startswith("```json"):
-        output = output[7:]
-    if output.startswith("```"):
-        output = output[3:]
-    if output.endswith("```"):
-        output = output[:-3]
-    output = output.strip()
-
-    return FilterResult.model_validate_json(output)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _format_jobs_for_prompt(batch: list[dict]) -> str:
-    """Format a batch of jobs into a text prompt."""
-    lines = []
-    for i, job in enumerate(batch):
-        title = str(job.get("title", "Unknown"))[:100]
-        company = str(job.get("company", "Unknown"))[:50]
-        location = str(job.get("location", "Unknown"))[:50]
-        description = str(job.get("description", ""))[:MAX_DESCRIPTION_CHARS]
-        url = job.get("url", "")
-
-        lines.append(
-            f"--- Job {i} ---\n"
-            f"Title: {title}\n"
-            f"Company: {company}\n"
-            f"Location: {location}\n"
-            f"Description: {description}\n"
-            f"URL: {url}\n"
-        )
-
-    return "\n".join(lines)
-
-
-def _extract_approved(result: FilterResult, batch: list[dict]) -> list[dict]:
-    """Extract approved jobs with their reasons and scores."""
-    approved = []
-    for item in result.approved:
-        idx = item.job_index
-        if 0 <= idx < len(batch):
-            job = dict(batch[idx])
-            job["match_reason"] = item.reason
-            job["match_score"] = item.score if item.score else 0.0
-            approved.append(job)
-        else:
-            logger.warning("Invalid job_index %d in filter result", idx)
-
-    # Sort by score descending
-    approved.sort(key=lambda x: x.get("match_score", 0), reverse=True)
-    return approved
+        os.unlink(temp_file)
