@@ -262,7 +262,9 @@ def _build_hard_constraints(config: dict) -> str:
         lines.append(
             f"- GEOGRAPHIC FILTER: This search is limited to these countries/regions: {countries_str}. "
             f"REJECT any job where the job location or company headquarters is outside these areas. "
-            f"Jobs must be physically based in one of these countries, not just 'remote to' them."
+            f"Jobs must be physically based in one of these countries, not just 'remote to' them. "
+            f"IMPORTANT: 'Remote, US', 'Remote, UK', 'Remote, London', 'Remote, Germany', and similar "
+            f"patterns are OUTSIDE the focus zone and MUST be rejected."
         )
 
     # Company exclusion list
