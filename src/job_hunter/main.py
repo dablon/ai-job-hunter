@@ -720,6 +720,8 @@ def main() -> None:
         config["locations"] = zone_locations
         # Also set primary location for backwards compatibility
         config["location"] = zone_locations[0]
+        # Set focus_countries for filter to enforce geographic boundary
+        config["focus_countries"] = zone_locations
         logger.info("Focus zone '%s' applied — %d locations: %s",
                    args.focus_zone, len(zone_locations), ", ".join(zone_locations[:5]) + "...")
 

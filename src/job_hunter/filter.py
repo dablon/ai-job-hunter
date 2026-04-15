@@ -14,6 +14,8 @@ from pydantic import BaseModel, ValidationError
 
 from job_hunter.utils import retry_with_backoff
 
+import re
+
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_MODEL = "claude-haiku-4-5"
@@ -35,6 +37,102 @@ class ApprovedJob(BaseModel):
 
 class FilterResult(BaseModel):
     approved: list[ApprovedJob]
+
+
+# Countries that are NOT in the LATAM focus zone (for pre-filtering)
+NON_LATAM_RE = re.compile(
+    r"\b(usa|united states|uk|united kingdom|london|lisbon|israel|berlin|"
+    r"paris|amsterdam|dublin|singapore|australia|canada|india|germany|"
+    r"france|netherlands|ireland|saudi|uae|japan|china|hong kong|hongkong|"
+    r"south korea|new zealand|indonesia|malaysia|thailand|vietnam|philippines)",
+    re.IGNORECASE,
+)
+
+
+def _prefilter_by_geo(jobs: list[dict], config: dict) -> list[dict]:
+    """Quick pre-filter to reject jobs with non-LATAM locations before AI filtering.
+
+    This runs before the expensive AI filtering to remove obviously invalid jobs.
+    Only active when focus_countries is set in config.
+    """
+    focus_countries = config.get("focus_countries", [])
+    if not focus_countries:
+        return jobs  # No geo pre-filtering if no focus zone
+
+    # Build a set of valid country name/codes for fast lookup
+    valid_countries = set()
+    for c in focus_countries:
+        valid_countries.add(c.lower())
+        # Add common variations
+        if c.lower() == "argentina":
+            valid_countries.update(["ar", "argentina", "buenos aires", "cordoba"])
+        elif c.lower() == "brazil":
+            valid_countries.update(["br", "brazil", "brasil", "brasília", "são paulo", "rio de janeiro"])
+        elif c.lower() == "chile":
+            valid_countries.update(["cl", "chile", "santiago"])
+        elif c.lower() == "colombia":
+            valid_countries.update(["co", "colombia", "bogotá", "bogota", "medellín", "medellin"])
+        elif c.lower() == "costa rica":
+            valid_countries.update(["cr", "costa rica", "san josé", "san jose"])
+        elif c.lower() == "ecuador":
+            valid_countries.update(["ec", "ecuador", "quito"])
+        elif c.lower() == "mexico":
+            valid_countries.update(["mx", "mexico", "guadalajara", "monterrey", "ciudad de méxico"])
+        elif c.lower() == "panama":
+            valid_countries.update(["pa", "panama", "ciudad de panamá"])
+        elif c.lower() == "peru":
+            valid_countries.update(["pe", "peru", "lima"])
+        elif c.lower() == "uruguay":
+            valid_countries.update(["uy", "uruguay", "montevideo"])
+        elif c.lower() == "venezuela":
+            valid_countries.update(["ve", "venezuela"])
+
+    approved = []
+    rejected_count = 0
+    for job in jobs:
+        loc = str(job.get("location", "")).strip()
+
+        # Empty locations and "Remote" are passed to AI for final decision
+        if not loc or loc.lower() == "remote":
+            approved.append(job)
+            continue
+
+        # Check for obviously non-LATAM country names/codes
+        loc_lower = loc.lower()
+        if NON_LATAM_RE.search(loc_lower):
+            logger.debug(f"Pre-filter rejected (non-LATAM): {job.get('title','')} @ {loc}")
+            rejected_count += 1
+            continue
+
+        # Extract potential country code (last 2-3 characters after comma or standalone)
+        words = loc.replace(",", " ").split()
+        valid = False
+        for word in words:
+            word_clean = word.lower().strip()
+            # Check 2-letter country codes
+            if len(word_clean) == 2 and word_clean in valid_countries:
+                valid = True
+                break
+            # Check country names
+            if word_clean in valid_countries:
+                valid = True
+                break
+        # Also check full location string against valid country names
+        if not valid:
+            for vc in valid_countries:
+                if vc in loc_lower and len(vc) > 2:  # Only match full country names, not 2-letter codes
+                    valid = True
+                    break
+
+        if valid:
+            approved.append(job)
+        else:
+            # Location not recognized as LATAM - let AI decide
+            approved.append(job)
+
+    if rejected_count > 0:
+        logger.info(f"Geo pre-filter rejected {rejected_count} non-LATAM jobs")
+    return approved
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +327,9 @@ def filter_jobs(
         logger.info("No jobs to filter")
         return []
 
+    # Pre-filter by geography before expensive AI filtering
+    jobs = _prefilter_by_geo(jobs, config)
+
     profile = config.get("profile", "")
     constraints = _build_hard_constraints(config)
 
@@ -345,6 +446,16 @@ def _build_hard_constraints(config: dict) -> str:
         lines.append(
             f"- LOCATION: the user is in {location}. "
             f"Reject on-site jobs outside {location}."
+        )
+
+    # Focus zone locations (LATAM, EUROPE, etc.) - validate job is from one of these countries
+    focus_countries = config.get("focus_countries", [])
+    if focus_countries:
+        countries_str = ", ".join([f'"{c}"' for c in focus_countries])
+        lines.append(
+            f"- GEOGRAPHIC FILTER: This search is limited to these countries/regions: {countries_str}. "
+            f"REJECT any job where the job location or company headquarters is outside these areas. "
+            f"Jobs must be physically based in one of these countries, not just 'remote to' them."
         )
 
     # Company exclusion list
