@@ -193,6 +193,18 @@ DEFAULT_REPORT_DIR = Path("/app/data/reports")
 # Environment variable overrides — used in GitHub Actions (secrets)
 VALID_CHANNELS = {"email", "discord", "telegram", "sms", "whatsapp"}
 
+# Checkpoint / resume
+CHECKPOINT_PATH = Path(os.environ.get("CHECKPOINT_PATH", "config/checkpoint.json"))
+CHECKPOINT_VERSION = 1
+STAGES = ["profile", "collect", "filter", "research", "notify"]
+STAGE_STATS_KEYS = {
+    "profile": None,
+    "collect": "jobs_collected",
+    "filter": "jobs_approved",
+    "research": "jobs_researched",
+    "notify": "jobs_notified",
+}
+
 # Zone presets for geographic focus — expands to specific locations
 # IMPORTANT: Only use valid jobspy Country enum values (lowercase) to avoid crashes.
 # City names CANNOT be used as country_indeed values — they are passed directly to
@@ -387,6 +399,130 @@ def _save_sent_urls(urls: set[str]) -> None:
             json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
     except OSError as e:
         logger.error("Failed to save sent URLs: %s", e)
+
+
+def _load_checkpoint() -> dict | None:
+    """Load checkpoint from disk, or None if missing/corrupt."""
+    if not CHECKPOINT_PATH.exists():
+        return None
+    try:
+        with open(CHECKPOINT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") != CHECKPOINT_VERSION:
+            logger.warning("Checkpoint version mismatch — starting fresh")
+            return None
+        logger.info(
+            "Checkpoint loaded: stage=%s, collected=%d, approved=%d, researched=%d",
+            data.get("stage"),
+            len(data.get("collected_jobs", [])),
+            len(data.get("filtered_jobs", [])),
+            len(data.get("researched_jobs", [])),
+        )
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load checkpoint (starting fresh): %s", e)
+        return None
+
+
+def _save_checkpoint(
+    stage: str,
+    config: dict,
+    jobs: dict[str, list[dict]],
+    sent_urls: set[str],
+    stats: dict,
+) -> None:
+    """Atomically write checkpoint state to disk."""
+    from datetime import datetime, timezone
+
+    checkpoint = {
+        "version": CHECKPOINT_VERSION,
+        "stage": stage,
+        "profile_analyzed": jobs.get("profile_analyzed"),
+        "collected_jobs": jobs.get("collected_jobs", []),
+        "filtered_jobs": jobs.get("filtered_jobs", []),
+        "researched_jobs": jobs.get("researched_jobs", []),
+        "sent_urls": sorted(sent_urls),
+        "config_snapshot": {
+            "profile": config.get("profile", ""),
+            "keywords": config.get("keywords", []),
+            "provider": config.get("provider", "minimax"),
+            "locations": config.get("locations", []),
+            "focus_zone": config.get("focus_zone"),
+        },
+        "run_stats": stats,
+        "started_at": stats.get("started_at", datetime.now(timezone.utc).isoformat()),
+        "completed_at": None,
+        "last_saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        from job_hunter.utils import atomic_write_json
+        atomic_write_json(CHECKPOINT_PATH, checkpoint)
+        logger.info("Checkpoint saved: stage=%s", stage)
+    except OSError as e:
+        logger.error("Failed to save checkpoint: %s", e)
+
+
+def _wipe_checkpoint() -> None:
+    """Delete checkpoint file if it exists."""
+    try:
+        CHECKPOINT_PATH.unlink(missing_ok=True)
+        logger.info("Checkpoint wiped")
+    except OSError as e:
+        logger.error("Failed to wipe checkpoint: %s", e)
+
+
+def _prompt_resume_choice(checkpoint: dict) -> str:
+    """Show interactive prompt and return user's choice: 'resume', 'fresh', or 'wipe'.
+
+    Runs only in interactive (tty) mode. In non-tty (CI), returns 'resume'.
+    """
+    stage = checkpoint.get("stage", "unknown")
+    collected = len(checkpoint.get("collected_jobs", []))
+    approved = len(checkpoint.get("filtered_jobs", []))
+    researched = len(checkpoint.get("researched_jobs", []))
+    last_saved = checkpoint.get("last_saved_at", "unknown")
+
+    stage_names = {
+        "profile": "PROFILE ANALYSIS",
+        "collect": "COLLECTION",
+        "filter": "AI FILTERING",
+        "research": "RESEARCH",
+        "notify": "NOTIFICATIONS",
+    }
+    stage_display = stage_names.get(stage, stage.upper())
+    stage_index = STAGES.index(stage) if stage in STAGES else 0
+    pct = int((stage_index / len(STAGES)) * 100)
+
+    print()
+    print(colorize("╭────────────────────────────────────────────────────────╮", Colors.CYAN))
+    print(colorize("│  💾 Checkpoint Found — Resume Previous Run?            │", Colors.CYAN))
+    print(colorize("├────────────────────────────────────────────────────────┤", Colors.CYAN))
+    print(colorize(f"│  Stage: {stage_display} ({pct}% complete)".ljust(58) + "│", Colors.CYAN))
+    print(colorize(f"│  Jobs collected: {collected}  |  Approved: {approved}  |  Researched: {researched}".ljust(58) + "│", Colors.CYAN))
+    print(colorize(f"│  Last saved: {last_saved}".ljust(58) + "│", Colors.CYAN))
+    print(colorize("│                                                        │", Colors.CYAN))
+    print(colorize("│  [R]esume  — Continue from last stage                 │", Colors.GREEN))
+    print(colorize("│  [F]resh   — Start new run (keep checkpoint)          │", Colors.YELLOW))
+    print(colorize("│  [W]ipe    — Delete checkpoint and start fresh         │", Colors.RED))
+    print(colorize("│                                                        │", Colors.CYAN))
+    print(colorize("│  Press R/F/W and Enter...                             │", Colors.CYAN))
+    print(colorize("╰────────────────────────────────────────────────────────╯", Colors.CYAN))
+    print()
+
+    while True:
+        try:
+            choice = input("Your choice [R/f/w]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            choice = "r"
+        if choice in ("r", "f", "w", ""):
+            break
+        print("Invalid choice. Press R, F, or W and Enter.")
+
+    if choice == "":
+        choice = "r"
+    return {"r": "resume", "f": "fresh", "w": "wipe"}.get(choice, "resume")
 
 
 def _deduplicate_jobs(jobs: list[dict], sent_urls: set[str]) -> list[dict]:
@@ -620,17 +756,34 @@ def main() -> None:
         if _handler_state["shutdown_requested"]:
             return  # Already handling — don't double-process
         _handler_state["shutdown_requested"] = True
-        logger.warning("Shutdown signal received — saving pending jobs before exit...")
-        jobs = _handler_state["jobs"]
-        cfg = _handler_state["config"]
-        if jobs and cfg:
-            try:
-                from job_hunter.mailer import _build_html, _build_plaintext
-                report_path = _save_report(jobs, cfg.get("provider", "minimax"))
-                _save_pending(jobs)
-                logger.info("Shutdown save complete. Report: %s", report_path)
-            except Exception:
-                logger.exception("Failed to save pending jobs on shutdown")
+        logger.warning("Shutdown signal received — saving checkpoint before exit...")
+        jobs = _handler_state.get("jobs", [])
+        cfg = _handler_state.get("config", {})
+
+        # Determine stage from what we have
+        if isinstance(jobs, list) and len(jobs) > 0:
+            stage = "collect"
+        else:
+            stage = "profile"
+
+        stage_jobs_handler: dict[str, list[dict]] = {
+            "profile_analyzed": [],
+            "collected_jobs": jobs if isinstance(jobs, list) else [],
+            "filtered_jobs": [],
+            "researched_jobs": [],
+        }
+        run_stats_handler = {
+            "jobs_collected": len(jobs) if isinstance(jobs, list) else 0,
+            "jobs_approved": 0,
+            "jobs_researched": 0,
+            "jobs_notified": 0,
+        }
+
+        try:
+            _save_checkpoint(stage, cfg, stage_jobs_handler, set(), run_stats_handler)
+            logger.info("Shutdown save complete")
+        except Exception:
+            logger.exception("Failed to save checkpoint on shutdown")
         sys.exit(128 + signum)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -814,60 +967,106 @@ def main() -> None:
             "No notification channels are configured. Pipeline will run but only save reports."
         )
 
-    # Step 0: AI Profile Analysis & Refinement
-    logger.info("--- Step 0: AI Profile Analysis ---")
-    from job_hunter.filter import analyze_and_refine_profile
-    original_profile = config.get("profile", "")
-    config = analyze_and_refine_profile(config, provider=args.provider)
-    # Keep the original detailed profile for filtering — only use refined keywords
-    config["profile"] = original_profile
-    if config.get("search_tips"):
-        logger.info("Search tips: %s", config["search_tips"])
-    logger.info("Profile: %s...", original_profile[:100])
+    # ===== CHECKPOINT RESUME LOGIC =====
+    checkpoint = _load_checkpoint()
+    resume_choice = None
 
-    # Cap keywords to avoid excessive scraping time
-    keywords = config.get("keywords", [])
-    if len(keywords) > MAX_KEYWORDS:
-        logger.info(
-            "Capping keywords from %d to %d", len(keywords), MAX_KEYWORDS
-        )
-        config["keywords"] = keywords[:MAX_KEYWORDS]
-    logger.info("Keywords (%d): %s", len(config.get("keywords", [])), config.get("keywords", []))
+    if checkpoint:
+        if args.resume:
+            resume_choice = "resume"
+        elif not sys.stdin.isatty():
+            # Non-interactive (CI): auto-resume if checkpoint exists
+            resume_choice = "resume"
+        else:
+            resume_choice = _prompt_resume_choice(checkpoint)
 
-    if args.resume:
-        if not PENDING_JOBS_PATH.exists():
-            logger.error(
-                "--resume requested but %s not found. Run without --resume first.",
-                PENDING_JOBS_PATH,
-            )
-            sys.exit(1)
-        jobs = _load_pending()
-        _handler_state["jobs"] = jobs
-        _handler_state["config"] = config
+        if resume_choice == "wipe":
+            _wipe_checkpoint()
+            checkpoint = None
+            resume_choice = None
+        elif resume_choice == "fresh":
+            checkpoint = None
+            resume_choice = None
+
+    # Initialize run stats and stage jobs container
+    from datetime import datetime, timezone
+    run_stats = {
+        "jobs_collected": 0,
+        "jobs_approved": 0,
+        "jobs_researched": 0,
+        "jobs_notified": 0,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    stage_jobs: dict[str, list[dict]] = {
+        "profile_analyzed": {},
+        "collected_jobs": [],
+        "filtered_jobs": [],
+        "researched_jobs": [],
+    }
+    # ===== END CHECKPOINT RESUME LOGIC =====
+
+    # ===== STAGE: PROFILE =====
+    _cp_stage = checkpoint.get("stage", "") if checkpoint else ""
+    _cp_idx = STAGES.index(_cp_stage) if _cp_stage in STAGES else -1
+    if _cp_idx < STAGES.index("profile"):
+        # profile is done (checkpoint stage is after profile)
+        cfg_snap = checkpoint.get("config_snapshot", {})
+        config.update(cfg_snap)
+        stage_jobs["profile_analyzed"] = checkpoint.get("profile_analyzed", {})
+        run_stats = checkpoint.get("run_stats", run_stats)
+        logger.info("Profile stage skipped (loaded from checkpoint)")
+    else:
+        logger.info("--- Step 0: AI Profile Analysis ---")
+        from job_hunter.filter import analyze_and_refine_profile
+        original_profile = config.get("profile", "")
+        config = analyze_and_refine_profile(config, provider=args.provider)
+        config["profile"] = original_profile
+        if config.get("search_tips"):
+            logger.info("Search tips: %s", config["search_tips"])
+        logger.info("Profile: %s...", original_profile[:100])
+
+        keywords = config.get("keywords", [])
+        if len(keywords) > MAX_KEYWORDS:
+            logger.info("Capping keywords from %d to %d", len(keywords), MAX_KEYWORDS)
+            config["keywords"] = keywords[:MAX_KEYWORDS]
+        logger.info("Keywords (%d): %s", len(config.get("keywords", [])), config.get("keywords", []))
+
+        stage_jobs["profile_analyzed"] = {
+            "refined_profile": config.get("profile", ""),
+            "keywords": config.get("keywords", []),
+            "search_tips": config.get("search_tips", ""),
+        }
+        _save_checkpoint("profile", config, stage_jobs, set(), run_stats)
+
+    # ===== STAGE: COLLECT =====
+    _cp_idx = STAGES.index(checkpoint.get("stage", "")) if checkpoint and checkpoint.get("stage") in STAGES else -1
+    if _cp_idx >= STAGES.index("collect"):
+        # collect already done
+        jobs = checkpoint.get("collected_jobs", [])
+        stage_jobs["collected_jobs"] = jobs
+        run_stats = checkpoint.get("run_stats", run_stats)
+        logger.info("Collection stage skipped (loaded %d jobs from checkpoint)", len(jobs))
     else:
         if not config.get("keywords"):
             logger.error("Missing keywords — set at least one search keyword in config.json")
             sys.exit(1)
 
-        # Step 1: Collect jobs from all sources
         keywords = config.get("keywords", [])
         step_box("collect", f"Searching {len(keywords)} keywords\nSources: LinkedIn, Indeed, Glassdoor, Gupy, RemoteOK", "running")
 
         jobs = collect_all(config)
-
-        # Keep jobs in scope for SIGTERM handler
+        stage_jobs["collected_jobs"] = jobs
         _handler_state["jobs"] = jobs
         _handler_state["config"] = config
 
         if not jobs:
             step_box("collect", "No jobs found from any source", "warn")
+            _wipe_checkpoint()
             return
 
-        # Show collection summary with color
+        run_stats["jobs_collected"] = len(jobs)
         step_box("collect", f"Successfully collected {color_job_count(len(jobs))} jobs", "done")
-
-        _save_pending(jobs)
-
+        _save_checkpoint("collect", config, stage_jobs, set(), run_stats)
     # Deduplicate against previously sent jobs
     sent_urls = _load_sent_urls()
     jobs = _deduplicate_jobs(jobs, sent_urls)
@@ -886,40 +1085,61 @@ def main() -> None:
         step_box("collect", "All jobs filtered out by salary range", "warn")
         return
 
-    # Step 2: AI filtering
-    filter_info = f"Processing {len(jobs)} jobs\nAI Provider: {colorize(args.provider.upper(), Colors.GREEN)}"
-    step_box("filter", filter_info, "running")
-
-    try:
-        approved_jobs = filter_jobs(jobs, config, provider=args.provider)
-    except RuntimeError:
-        step_box("filter", "AI filtering failed. Run with --resume to retry.", "error")
-        sys.exit(1)
-
-    if not approved_jobs:
-        step_box("filter", "No jobs passed the AI filter", "warn")
-        return
-
-    # Show filtering results
-    pass_rate = (len(approved_jobs)/len(jobs)*100) if jobs else 0
-    filter_result = f"Approved {color_job_count(len(approved_jobs))} jobs\nPass rate: {colorize(f'{pass_rate:.1f}%', Colors.GREEN)}"
-    step_box("filter", filter_result, "done")
-
-    # Step 3: AI Research — generate preparation guides for each approved job
-    if approved_jobs and not args.no_research:
-        research_info = f"Researching {len(approved_jobs)} jobs\nProvider: {colorize(args.provider.upper(), Colors.GREEN)}"
-        step_box("research", research_info, "running")
+    # ===== STAGE: FILTER =====
+    if checkpoint is None or checkpoint.get("stage") not in STAGES[:STAGES.index("filter")]:
+        filter_info = f"Processing {len(jobs)} jobs\nAI Provider: {colorize(args.provider.upper(), Colors.GREEN)}"
+        step_box("filter", filter_info, "running")
 
         try:
-            approved_jobs = research_jobs(approved_jobs, config, provider=args.provider, parallel=True)
-            step_box("research", f"Preparation guides generated for {color_job_count(len(approved_jobs))} jobs", "done")
-        except Exception:
-            logger.exception("Research step failed — continuing without preparation guides")
-            step_box("research", "Research failed — jobs sent without preparation guides", "warn")
+            approved_jobs = filter_jobs(jobs, config, provider=args.provider)
+        except RuntimeError:
+            step_box("filter", "AI filtering failed. Run with --resume to retry.", "error")
+            sys.exit(1)
+
+        if not approved_jobs:
+            step_box("filter", "No jobs passed the AI filter", "warn")
+            return
+
+        pass_rate = (len(approved_jobs)/len(jobs)*100) if jobs else 0
+        filter_result = f"Approved {color_job_count(len(approved_jobs))} jobs\nPass rate: {colorize(f'{pass_rate:.1f}%', Colors.GREEN)}"
+        step_box("filter", filter_result, "done")
+
+        stage_jobs["filtered_jobs"] = approved_jobs
+        run_stats["jobs_approved"] = len(approved_jobs)
+        _save_checkpoint("filter", config, stage_jobs, sent_urls, run_stats)
+
+    _cp_idx = STAGES.index(checkpoint.get("stage", "")) if checkpoint and checkpoint.get("stage") in STAGES else -1
+    if _cp_idx >= STAGES.index("filter"):
+        approved_jobs = checkpoint.get("filtered_jobs", [])
+        stage_jobs["filtered_jobs"] = approved_jobs
+        run_stats = checkpoint.get("run_stats", run_stats)
+        logger.info("Filter stage skipped (loaded %d approved jobs from checkpoint)", len(approved_jobs))
+
+    # ===== STAGE: RESEARCH =====
+    if approved_jobs and not args.no_research:
+        if _cp_idx < STAGES.index("research"):
+            research_info = f"Researching {len(approved_jobs)} jobs\nProvider: {colorize(args.provider.upper(), Colors.GREEN)}"
+            step_box("research", research_info, "running")
+
+            try:
+                approved_jobs = research_jobs(approved_jobs, config, provider=args.provider, parallel=True)
+                step_box("research", f"Preparation guides generated for {color_job_count(len(approved_jobs))} jobs", "done")
+            except Exception:
+                logger.exception("Research step failed — continuing without preparation guides")
+                step_box("research", "Research failed — jobs sent without preparation guides", "warn")
+
+            stage_jobs["researched_jobs"] = approved_jobs
+            run_stats["jobs_researched"] = len(approved_jobs)
+            _save_checkpoint("research", config, stage_jobs, sent_urls, run_stats)
+        else:
+            approved_jobs = checkpoint.get("researched_jobs", [])
+            stage_jobs["researched_jobs"] = approved_jobs
+            run_stats = checkpoint.get("run_stats", run_stats)
+            logger.info("Research stage skipped (loaded %d researched jobs from checkpoint)", len(approved_jobs))
     elif args.no_research:
         step_box("research", "Research skipped by --no-research flag", "warn")
 
-    # Step 4: Send notifications
+    # ===== STAGE: NOTIFY =====
     ch_str = colorize(", ".join(viable_channels), Colors.YELLOW) if viable_channels else colorize("none", Colors.GRAY)
     notify_info = f"Channels: {ch_str}\nJobs to send: {color_job_count(len(approved_jobs))}"
     step_box("notify", notify_info, "running")
@@ -937,7 +1157,13 @@ def main() -> None:
     else:
         step_box("notify", "Full report — sent_urls.json not updated", "warn")
 
-    # Final completion with fancy ASCII
+    run_stats["jobs_notified"] = len(approved_jobs)
+    _save_checkpoint("notify", config, stage_jobs, sent_urls, run_stats)
+
+    # ===== SUCCESS — wipe checkpoint =====
+    _wipe_checkpoint()
+
+    # ===== FINAL COMPLETION =====
     print()
     print(colorize("╔" + "═" * 56 + "╗", Colors.GREEN))
     print(colorize("║", Colors.GREEN) + colorize(" 🎉 HUNT COMPLETE! ".center(56), Colors.GREEN + Colors.BOLD) + colorize("║", Colors.GREEN))
