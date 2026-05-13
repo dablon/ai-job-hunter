@@ -8,9 +8,11 @@ import subprocess
 import tempfile
 import time
 
+import re
+
 import anthropic
 import requests
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from job_hunter.utils import retry_with_backoff
 
@@ -35,6 +37,97 @@ class ApprovedJob(BaseModel):
 
 class FilterResult(BaseModel):
     approved: list[ApprovedJob]
+
+
+# Countries that are NOT in the LATAM focus zone (for pre-filtering)
+NON_LATAM_RE = re.compile(
+    r"\b(usa|united states|u\.s\.|u\.s|uk|united kingdom|england|london|britain|"
+    r"israel|germany|france|netherlands|ireland|belgium|austria|switzerland|"
+    r"spain|portugal|italy|poland|czech|hungary|romania|bulgaria|"
+    r"saudi|uae|qatar|india|china|hong kong|japan|south korea|australia|new zealand|"
+    r"indonesia|malaysia|thailand|vietnam|philippines|canada)\b",
+    re.IGNORECASE
+)
+
+# Only accept jobs from these LATAM country patterns
+LATAM_RE = re.compile(
+    r"\b(argentina|brazil|brasil|chile|colombia|costa rica|ecuador|mexico|panama|peru|uruguay|venezuela|"
+    r"buenos aires|santiago|bogota|bogotá|medellin|medellín|sao paulo|são paulo|rio de janeiro|"
+    r"mexico city|guadalajara|monterrey|tijuana|"
+    r"quito|lima|montevideo|panama city|ciudad de panama|caracas|"
+    r"ar\b|br\b|cl\b|co\b|cr\b|ec\b|mx\b|pa\b|pe\b|uy\b|ve\b)",
+    re.IGNORECASE
+)
+
+# Specific patterns that are clearly non-LATAM even if they contain LATAM words
+REMOTE_NON_LATAM_RE = re.compile(
+    r"remote\s*,?\s*(us|united states|u\.s\.|u\.s|a\.s\.?|uk|united kingdom|england|london|britain|"
+    r"germany|france|netherlands|ireland|belgium|austria|switzerland|spain|portugal|italy|"
+    r"poland|czech|hungary|romania|bulgaria|saudi|uae|qatar|india|china|hong kong|japan|"
+    r"south korea|australia|new zealand|indonesia|malaysia|thailand|vietnam|philippines|canada|singapore)",
+    re.IGNORECASE
+)
+
+
+def _prefilter_by_geo(jobs: list[dict], config: dict) -> list[dict]:
+    """Quick pre-filter to reject jobs with non-LATAM locations before AI filtering.
+
+    This runs before the expensive AI filtering to remove obviously invalid jobs.
+    Only active when focus_countries is set in config.
+    """
+    focus_countries = config.get("focus_countries", [])
+    if not focus_countries:
+        return jobs  # No geo pre-filtering if no focus zone
+
+    approved = []
+    rejected_count = 0
+    for job in jobs:
+        loc = str(job.get("location", "")).strip()
+        loc_lower = loc.lower()
+
+        # "Remote" alone or empty - let AI decide
+        if not loc or loc_lower == "remote":
+            approved.append(job)
+            continue
+
+        # CHECK ORDER: LATAM first (allow), then non-LATAM (reject)
+
+        # 1. Does it match a LATAM pattern? → ALLOW
+        if LATAM_RE.search(loc_lower):
+            approved.append(job)
+            continue
+
+        # 2. Does it match a non-LATAM country name? → REJECT
+        if NON_LATAM_RE.search(loc_lower):
+            logger.debug(f"Pre-filter rejected (non-LATAM): {job.get('title','')} @ {loc}")
+            rejected_count += 1
+            continue
+
+        # 3. Does it match "Remote, US/UK/etc." (non-LATAM remote)? → REJECT
+        if REMOTE_NON_LATAM_RE.search(loc_lower):
+            logger.debug(f"Pre-filter rejected (remote non-LATAM): {job.get('title','')} @ {loc}")
+            rejected_count += 1
+            continue
+
+        # 4. Check for valid 2-letter LATAM country codes in location string
+        valid_codes = {"ar", "br", "cl", "co", "cr", "ec", "mx", "pa", "pe", "uy", "ve"}
+        words = loc.replace(",", " ").split()
+        code_found = False
+        for word in words:
+            wc = word.lower().strip()
+            if len(wc) == 2 and wc in valid_codes:
+                code_found = True
+                break
+
+        if code_found:
+            approved.append(job)
+        else:
+            # Unknown location - let AI decide
+            approved.append(job)
+
+    if rejected_count > 0:
+        logger.info(f"Geo pre-filter rejected {rejected_count} non-LATAM jobs")
+    return approved
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +322,9 @@ def filter_jobs(
         logger.info("No jobs to filter")
         return []
 
+    # Pre-filter by geography before expensive AI filtering
+    jobs = _prefilter_by_geo(jobs, config)
+
     profile = config.get("profile", "")
     constraints = _build_hard_constraints(config)
 
@@ -345,6 +441,18 @@ def _build_hard_constraints(config: dict) -> str:
         lines.append(
             f"- LOCATION: the user is in {location}. "
             f"Reject on-site jobs outside {location}."
+        )
+
+    # Focus zone locations (LATAM, EUROPE, etc.) - validate job is from one of these countries
+    focus_countries = config.get("focus_countries", [])
+    if focus_countries:
+        countries_str = ", ".join([f'"{c}"' for c in focus_countries])
+        lines.append(
+            f"- GEOGRAPHIC FILTER: This search is limited to these countries/regions: {countries_str}. "
+            f"REJECT any job where the job location or company headquarters is outside these areas. "
+            f"Jobs must be physically based in one of these countries, not just 'remote to' them. "
+            f"IMPORTANT: 'Remote, US', 'Remote, UK', 'Remote, London', 'Remote, Germany', and similar "
+            f"patterns are OUTSIDE the focus zone and MUST be rejected."
         )
 
     # Company exclusion list
@@ -543,78 +651,60 @@ def _filter_batch_minimax(
         "Content-Type": "application/json",
     }
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.2,
+    }
 
-    max_tokens = MAX_TOKENS
-    last_exc: Exception | None = None
+    def _call() -> FilterResult:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=MINIMAX_TIMEOUT,
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Extract content from Minimax response
+        if "choices" in data and len(data["choices"]) > 0:
+            content = data["choices"][0]["message"]["content"]
+        else:
+            raise RuntimeError(f"Unexpected Minimax response: {data}")
+        
+        # Parse JSON from response (may be wrapped in markdown)
+        content = content.strip()
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+        
+        # Ensure we have valid JSON by adding braces if needed
+        if not content.startswith("{"):
+            # Find the first { and last }
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                content = content[start:end+1]
+        
+        return FilterResult.model_validate_json(content)
 
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": 0.2,
-            }
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=MINIMAX_TIMEOUT,
-            )
-            response.raise_for_status()
-
-            data = response.json()
-
-            # Extract content from Minimax response
-            if "choices" in data and len(data["choices"]) > 0:
-                content = data["choices"][0]["message"]["content"]
-            else:
-                raise RuntimeError(f"Unexpected Minimax response: {data}")
-
-            # Parse JSON from response (may be wrapped in markdown)
-            content = content.strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
-
-            # Ensure we have valid JSON by adding braces if needed
-            if not content.startswith("{"):
-                # Find the first { and last }
-                start = content.find("{")
-                end = content.rfind("}")
-                if start >= 0 and end > start:
-                    content = content[start:end+1]
-
-            return FilterResult.model_validate_json(content)
-        except ValidationError as exc:
-            # JSON parsing failed (truncated response) - retry with more tokens
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                max_tokens *= 2
-                logger.warning(
-                    f"[minimax] Response truncated at max_tokens={max_tokens//2}, "
-                    f"retrying with max_tokens={max_tokens}"
-                )
-                time.sleep(RETRY_BASE_DELAY * (attempt + 1))
-                continue
-            raise
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                continue
-            raise
-
-    # Should not reach here, but raise last exception if we did
-    raise last_exc or RuntimeError("Unexpected exit from Minimax retry loop")
+    return retry_with_backoff(
+        _call,
+        max_retries=MAX_RETRIES,
+        base_delay=RETRY_BASE_DELAY,
+        retryable=(requests.exceptions.RequestException,),
+        context="minimax",
+    )
 
 
 # ---------------------------------------------------------------------------
