@@ -1010,7 +1010,7 @@ def main() -> None:
     # ===== STAGE: PROFILE =====
     _cp_stage = checkpoint.get("stage", "") if checkpoint else ""
     _cp_idx = STAGES.index(_cp_stage) if _cp_stage in STAGES else -1
-    if _cp_idx < STAGES.index("profile"):
+    if checkpoint is not None and _cp_idx >= STAGES.index("profile"):
         # profile is done (checkpoint stage is after profile)
         cfg_snap = checkpoint.get("config_snapshot", {})
         config.update(cfg_snap)

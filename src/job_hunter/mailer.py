@@ -54,14 +54,16 @@ def validate_smtp_config(config: dict) -> bool:
         or (config.get("smtp_password", "") if "SG." in config.get("smtp_password", "") else "")
     )
     if sendgrid_key:
-        # Looks like a SendGrid API key — try a lightweight connectivity check
+        # Test SendGrid API with a lightweight POST (zero-cost, no actual mail sent)
         try:
-            resp = requests.get(
-                "https://api.sendgrid.com/v3/api_keys",
-                headers={"Authorization": f"Bearer {sendgrid_key}"},
+            resp = requests.post(
+                "https://api.sendgrid.com/v3/api_keys/validates",
+                headers={"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"},
+                json={},
                 timeout=10,
             )
-            if resp.status_code in (200, 401):
+            # 2xx = valid key & reachable; any 4xx (not 429) also means the key is valid
+            if 200 <= resp.status_code < 300 or resp.status_code in (400, 401, 403, 404):
                 logger.info("SendGrid API reachable — HTTP API will be used")
                 return True
             logger.warning("SendGrid API returned %s — will fall back to SMTP", resp.status_code)

@@ -687,15 +687,46 @@ def _filter_batch_minimax(
         if content.endswith("```"):
             content = content[:-3]
         content = content.strip()
-        
-        # Ensure we have valid JSON by adding braces if needed
+
+        # Fix truncated JSON — Minimax can truncate long responses mid-string.
+        # If content doesn't parse, try to find a valid prefix by truncating
+        # at the last complete field before the cut.
+        try:
+            return FilterResult.model_validate_json(content)
+        except Exception:
+            pass
+
+        # Truncation repair: content may be cut mid-string, e.g.
+        # '{"approved": [{"job_title": "DevOps Eng...","match_reason": "Strong'
+        # Fix by trimming to last safe closing brace
         if not content.startswith("{"):
-            # Find the first { and last }
             start = content.find("{")
             end = content.rfind("}")
             if start >= 0 and end > start:
                 content = content[start:end+1]
-        
+        else:
+            # Content starts with { but is truncated — find last complete field
+            # by scanning backwards for a safe truncation point
+            lines = content.split("\n")
+            fixed_lines = []
+            for line in reversed(lines):
+                try:
+                    test = "\n".join(fixed_lines + [line])
+                    import json
+                    json.loads(test)
+                    fixed_lines.insert(0, line)
+                    break
+                except Exception:
+                    fixed_lines.insert(0, line)
+            content = "\n".join(fixed_lines)
+            if content.count('"') % 2 != 0:
+                # Odd number of quotes = unclosed string, trim trailing part
+                last_complete_field_end = content.rfind('","')
+                if last_complete_field_end > 0:
+                    content = content[:last_complete_field_end + 1] + "]}"
+                if content.count('"') % 2 != 0:
+                    content = content + '"'
+
         return FilterResult.model_validate_json(content)
 
     return retry_with_backoff(

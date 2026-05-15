@@ -34,9 +34,10 @@ env/
 *~
 
 # Job Hunter specific
-config.json
+# config.json
 .env
 pending_jobs.json
+checkpoint.json
 *.log
 
 # OS

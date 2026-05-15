@@ -110,6 +110,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
     preventing partial-file corruption if the process is killed mid-write.
     """
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, path)
